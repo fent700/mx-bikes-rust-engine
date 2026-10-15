@@ -24,6 +24,9 @@ pub struct SteerController {
     integral: f32,
     /// Last computed terms for telemetry (N·m).
     pub terms: [f32; 4],
+    /// Weight of the lean PID against the bar-centring PD, from the front wheel load: 1 at
+    /// 0.45 * m g / 2 and above, sin(load / ref * pi / 2) below (FUN_14019d360).
+    pub blend: f32,
 }
 
 impl Default for SteerController {
@@ -37,6 +40,7 @@ impl Default for SteerController {
             prev_heading: None,
             target_lean: 0.0,
             integral: 0.0,
+            blend: 1.0,
             terms: [0.0; 4],
         }
     }
@@ -83,7 +87,8 @@ impl SteerController {
         lean
     }
 
-    /// Returns handlebar torque (N·m) acting to increase the steer angle (positive = bars right).
+    /// Returns the lean PID handlebar torque (N·m) acting to increase the steer angle (positive =
+    /// bars right), before the front-load blend in [`Self::blend`] and the final clamp.
     pub fn torque(&mut self, def: &SteerDefinition, i: &SteerInputs) -> f32 {
         let dt = i.dt.max(1e-5);
 
@@ -137,7 +142,7 @@ impl SteerController {
         let yaw = def.k_yaw * (yaw_rate - steady_yaw) * DEG;
         self.terms = [p, d, ig, yaw];
 
-        // Fade out as the front wheel unloads (wheelies, jumps).
+        // Hand over to the centring PD as the front wheel unloads (wheelies, jumps).
         let reference = 0.45 * i.weight * 0.5;
         let blend = if i.front_load >= reference {
             1.0
@@ -149,6 +154,7 @@ impl SteerController {
         if blend < 0.5 {
             self.integral *= 0.99;
         }
-        ((p + d + ig + yaw) * blend).clamp(-MAX_TORQUE, MAX_TORQUE)
+        self.blend = blend;
+        p + d + ig + yaw
     }
 }

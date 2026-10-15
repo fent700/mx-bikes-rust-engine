@@ -11,9 +11,9 @@
 
 use crate::powertrain::Powertrain;
 use crate::rider_state::RiderState;
-use crate::steer_control::{SteerController, SteerInputs};
+use crate::steer_control::{SteerController, SteerInputs, MAX_TORQUE};
 use crate::suspension::{Fork, RearLinkage, Shock};
-use crate::tyre_model::TyreModel;
+use crate::tyre_model::{TyreInput, TyreModel};
 use glam::{Mat3, Quat, Vec2, Vec3};
 use mxbikes_formats::bike_def::BikeDefinition;
 use mxbikes_formats::reader::lh_to_rh;
@@ -24,8 +24,8 @@ pub const GRAVITY: f32 = 9.81;
 const AIR_DENSITY: f32 = 1.2;
 const SUBSTEP: f32 = 1.0 / 500.0;
 const RIDER_MASS: f32 = 80.0;
-const RELAX_LONG: f32 = 0.12;
-const RELAX_LAT: f32 = 0.05;
+/// Slip relaxation length (m) of both slip states (FUN_1401a2fb0).
+const RELAX_LEN: f32 = 0.15;
 /// Maps the original controller's output onto this engine's steer angle convention.
 const STEER_OUTPUT_SIGN: f32 = -1.0;
 
@@ -99,10 +99,17 @@ struct Wheel {
     omega: f32,
     /// Accumulated spin angle for rendering.
     angle: f32,
+    /// Slip states of FUN_1401a2fb0 (metres of relaxation-length deflection):
+    /// kappa = slip_long / 0.15, tan(alpha) = slip_lat / 0.15 at speed.
     slip_long: f32,
     slip_lat: f32,
     last_penetration: f32,
     brake_torque_max: f32,
+    /// Lever travel below which the brake does nothing: leverage ratio times DeadZone
+    /// (FUN_1401a5780).
+    brake_dead_zone: f32,
+    /// Peak longitudinal slip 3 Dx / Kx at the nominal load (FUN_140196500), used by the aids.
+    kappa_peak: f32,
     grip_scale: f32,
     telemetry: WheelTelemetry,
     /// Previous step contact point for difference-based rut speed (FUN_1401a2fb0 line 700).
@@ -122,11 +129,13 @@ pub fn dirt_level(amount: f32) -> u32 {
 }
 
 impl Wheel {
-    fn new(def: TyreDefinition, brake_torque_max: f32, grip_scale: f32) -> Self {
+    fn new(def: TyreDefinition, brake_torque_max: f32, brake_dead_zone: f32, grip_scale: f32) -> Self {
         let spin_inertia = def.inertia.x.max(0.1);
         let mass = def.mass;
+        let tyre = TyreModel::new(def);
+        let kappa_peak = tyre.kappa_peak();
         Self {
-            tyre: TyreModel::new(def),
+            tyre,
             mass,
             spin_inertia,
             omega: 0.0,
@@ -135,6 +144,8 @@ impl Wheel {
             slip_lat: 0.0,
             last_penetration: 0.0,
             brake_torque_max,
+            brake_dead_zone: brake_dead_zone.clamp(0.0, 0.99),
+            kappa_peak,
             grip_scale,
             telemetry: WheelTelemetry::default(),
             last_contact: None,
@@ -215,10 +226,14 @@ pub struct Motorcycle {
     pub crashed: bool,
     /// Profile aid `stabilityhelp_scale` (restoring torques, `FUN_1401a8480` lines 2095-2275).
     pub stability_help_scale: f32,
-    /// Profile aid `brakehelp` (anti-loop & anti-lock).
+    /// Profile aid `brakehelp` (FUN_1401ada40): front release on lock-up or when the rear
+    /// unloads, rear release on lock-up, both through a rate limiter.
     pub brake_help: bool,
-    /// Profile aid `tractionhelp` (slip-ratio throttle attenuation).
+    /// Profile aid `tractionhelp` (FUN_1401ada40): throttle limited down to 0.75 as rear slip
+    /// passes 0.7 to 2.1 times the peak slip.
     pub traction_help: bool,
+    /// Brake help lever limits (rise 6/s, fall 1.2/s), front and rear.
+    brake_help_level: [f32; 2],
     last_accel: Vec3,
     accumulator: f32,
     rut_accum: f32,
@@ -255,8 +270,8 @@ impl Motorcycle {
         };
 
         // `wheelN { Friction }` scales the tyre's surface grip.
-        let front = Wheel::new(tyres.0, def.brakes[0].max_torque(), def.brakes[0].wheel_friction);
-        let rear = Wheel::new(tyres.1, def.brakes[1].max_torque(), def.brakes[1].wheel_friction);
+        let front = Wheel::new(tyres.0, def.brakes[0].max_torque(), def.brakes[0].leverage * def.brakes[0].dead_zone, def.brakes[0].wheel_friction);
+        let rear = Wheel::new(tyres.1, def.brakes[1].max_torque(), def.brakes[1].leverage * def.brakes[1].dead_zone, def.brakes[1].wheel_friction);
 
         // Composite mass properties at the authored pose.
         let rake = g.rake_deg.to_radians();
@@ -329,6 +344,7 @@ impl Motorcycle {
             stability_help_scale: 0.0,
             brake_help: false,
             traction_help: false,
+            brake_help_level: [0.0; 2],
             last_accel: Vec3::ZERO,
             accumulator: 0.0,
             rut_accum: 0.0,
@@ -591,8 +607,8 @@ impl Motorcycle {
         let penetration = (gh - point.y) * n.y;
         if penetration <= 0.0 {
             wheel.last_penetration = 0.0;
-            wheel.slip_long *= 0.9;
-            wheel.slip_lat *= 0.9;
+            wheel.slip_long = 0.0;
+            wheel.slip_lat = 0.0;
             wheel.telemetry = WheelTelemetry::default();
             return None;
         }
@@ -607,29 +623,53 @@ impl Motorcycle {
         let contact_vel = axle_vel;
         let vx = contact_vel.dot(long);
         let vy = contact_vel.dot(lat);
-        let r_eff = (axle - point).length().max(r * 0.5);
-        let rolling = wheel.omega * r_eff;
 
-        // First-order relaxation of the slip states (stable through standstill).
-        let abs_vx = vx.abs();
-        wheel.slip_long += ((rolling - vx) - abs_vx * wheel.slip_long) / RELAX_LONG * dt;
-        wheel.slip_lat += ((-vy) - abs_vx * wheel.slip_lat) / RELAX_LAT * dt;
-        wheel.slip_long = wheel.slip_long.clamp(-2.0, 2.0);
-        wheel.slip_lat = wheel.slip_lat.clamp(-1.5, 1.5);
-        let kappa = wheel.slip_long;
-        let alpha = wheel.slip_lat.atan();
-        let gamma = spin_axis.dot(n).clamp(-1.0, 1.0).asin();
+        // Effective rolling radius (FUN_1401a2fb0): the torus section at the contact's lateral
+        // offset, R1 = R - (1 - cos phi) T with sin phi = offset / T, moved a third of the way
+        // towards the loaded radius (axle to ground contact in the wheel plane).
+        let ground_pt = point + n * penetration;
+        let rel = ground_pt - axle;
+        let offset = rel.dot(spin_axis);
+        let loaded = (rel - spin_axis * offset).length().max(r * 0.5);
+        let phi = (offset / rt.max(1e-4)).clamp(-1.0, 1.0).asin();
+        let r1 = r - (1.0 - phi.cos()) * rt;
+        let r_eff = r1 - (r1 - loaded) / 3.0;
+        let rolling = wheel.omega * r_eff;
 
         let surface = ground.surface(point.x, point.z);
         let grip_table = wheel.tyre.def.grip(surface);
-        let grip = grip_table.dry_grip * wheel.grip_scale;
-        let f = wheel.tyre.forces(fz, kappa, alpha, gamma, grip);
-        let roll_res = wheel.tyre.rolling_resistance(fz, &grip_table, 0.0) * (vx / 0.5).clamp(-1.0, 1.0);
+        let (surface_grip, resistance) = TyreModel::surface_terms(&grip_table, 0.0);
+        let grip = surface_grip * wheel.grip_scale;
+        let stiff = wheel.tyre.slip_stiffness(fz, grip, 1.0);
 
-        // Low-speed damping keeps a parked bike from creeping on the relaxation springs.
-        let creep = if abs_vx < 0.5 { (0.5 - abs_vx) * 2.0 } else { 0.0 };
-        let fx = f.fx - roll_res - creep * vx * fz * 0.02;
-        let fy = f.fy - creep * vy * fz * 0.05;
+        // Slip states with relaxation length 0.15 m, plus the low-speed terms that fade out by
+        // 2.5 m/s (stiffness-scaled slip velocity, 1000 N s/m at standstill).
+        let abs_vx = vx.abs();
+        let slip_vel = rolling - vx;
+        wheel.slip_long = ((slip_vel - wheel.slip_long * abs_vx / RELAX_LEN) * dt + wheel.slip_long).clamp(-0.5, 0.5);
+        wheel.slip_lat = ((-vy - wheel.slip_lat * abs_vx / RELAX_LEN) * dt + wheel.slip_lat).clamp(-1.0, 1.0);
+        let mut kappa = wheel.slip_long / RELAX_LEN;
+        let mut tan_alpha = wheel.slip_lat / RELAX_LEN;
+        if abs_vx <= 2.5 {
+            let blend = ((abs_vx / 2.5 * std::f32::consts::PI).cos() + 1.0) * 500.0;
+            kappa += blend / stiff.long * slip_vel;
+            tan_alpha -= blend / stiff.lat * vy;
+        }
+        let alpha = tan_alpha.atan();
+        let gamma = spin_axis.dot(n).clamp(-1.0, 1.0).asin();
+
+        let f = wheel.tyre.evaluate(TyreInput {
+            fz,
+            kappa,
+            alpha,
+            gamma,
+            grip,
+            lat_shape: 1.0,
+            resistance,
+            roll_speed: rolling,
+        });
+        let fx = f.fx;
+        let fy = f.fy;
 
         wheel.telemetry = WheelTelemetry {
             load: fz,
@@ -638,7 +678,7 @@ impl Motorcycle {
             camber: gamma,
             fx,
             fy,
-            contact: Some(point),
+            contact: Some(ground_pt),
             surface: Some(surface),
             rim_speed: wheel.omega * wheel.tyre.radius(),
             velocity: axle_vel,
@@ -647,9 +687,10 @@ impl Motorcycle {
         };
         Some(ContactResult {
             force: long * fx + lat * fy + n * fz,
-            point,
+            point: ground_pt,
             aligning: n * f.mz,
-            road_torque: -fx * r_eff,
+            // The rolling resistance moment acts on the wheel spin (dBodyAddRelTorque in the game).
+            road_torque: -fx * loaded + f.my,
         })
     }
 
@@ -684,14 +725,20 @@ impl Motorcycle {
         let rspin_w = lat_w;
 
         // --- Drivetrain.
+        let lean_cos = (-(rot * Vec3::X).y).asin().cos();
         let mut eff_throttle = inp.throttle;
         if self.traction_help {
-            let slip_r = self.rear.telemetry.slip_ratio;
-            if slip_r > 0.15 {
-                let excess: f32 = (slip_r - 0.15).max(0.0);
-                let cut: f32 = (1.0f32 - excess * 3.5f32).clamp(0.2f32, 1.0f32);
-                eff_throttle *= cut;
-            }
+            let kappa = self.rear.telemetry.slip_ratio;
+            let peak = lean_cos.powi(3) * self.rear.kappa_peak;
+            let (hi, lo) = (peak * 2.1, peak * 0.7);
+            let limit = if kappa > hi {
+                0.75
+            } else if kappa > lo {
+                (hi - kappa) / (hi - lo) * 0.25 + 0.75
+            } else {
+                1.0
+            };
+            eff_throttle = eff_throttle.min(limit);
         }
         self.powertrain.throttle = eff_throttle;
         self.powertrain.clutch_lever = inp.clutch;
@@ -827,10 +874,29 @@ impl Motorcycle {
         // a bar acceleration of 600 * error - 30 * rate (FUN_14019d360).
         // The controller runs every step so its lean / yaw rate histories stay current.
         let pid = STEER_OUTPUT_SIGN * self.steer_gain_scale * self.steer_ctrl.torque(st, &ctrl_in);
-        let mut rider_steer = if v >= 1.0 {
-            pid
+        // Bar PD of FUN_14019d360 (Kp = -600 I, Kd = 0.05 Kp from FUN_140197060).
+        let bar_pd = |target: f32| self.steer_inertia * (600.0 * (target - self.steer_angle) - 30.0 * self.steer_rate);
+        let front_down = front_load >= 1.0;
+        let rear_down = self.rear.telemetry.load >= 1.0;
+        let mut rider_steer = if v < 1.0 {
+            bar_pd(inp.steer * lock)
+        } else if front_down {
+            // Lean PID, handed over to centring the bars as the front unloads.
+            let b = self.steer_ctrl.blend;
+            (pid * b + (1.0 - b) * bar_pd(0.0)).clamp(-MAX_TORQUE, MAX_TORQUE)
         } else {
-            self.steer_inertia * (600.0 * (inp.steer * lock - self.steer_angle) - 30.0 * self.steer_rate)
+            // Front wheel in the air: with both wheels off the ground the bars line up with the
+            // direction of travel. INFERRED: with the rear still down (wheelie) the target is
+            // straight ahead; the decompiled target there is not resolvable.
+            let target = if rear_down {
+                0.0
+            } else {
+                // Heading of travel against the bike's heading, both in the ground plane.
+                let flat = |d: Vec3| Vec3::new(d.x, 0.0, d.z).normalize_or_zero();
+                let (f, r, vel) = (flat(forward), flat(rot * Vec3::X), flat(self.velocity));
+                if self.velocity.length_squared() > 1.0 { vel.dot(r).atan2(vel.dot(f)) } else { 0.0 }
+            };
+            bar_pd(target.clamp(-lock, lock)).clamp(-MAX_TORQUE, MAX_TORQUE)
         };
         if !self.rider_steering {
             rider_steer = 0.0;
@@ -881,23 +947,42 @@ impl Motorcycle {
 
         // --- Wheel spin.
         let mut front_lever = inp.front_brake;
-        let rear_lever = inp.rear_brake;
+        let mut rear_lever = inp.rear_brake;
         if self.brake_help {
-            // Anti-loop stoppie modulation: if rear wheel load is lost and pitching forward
-            let rear_load = self.rear.telemetry.load;
-            let pitch_rate = self.angular_velocity.dot(lat_w);
-            if rear_load < 100.0 && pitch_rate < 0.0 {
-                let fade = (rear_load / 100.0).clamp(0.1, 1.0);
-                front_lever *= fade;
+            let fast = speed > 8.0;
+            let mut front_limit = front_lever;
+            if fast && self.front.telemetry.slip_ratio < -(lean_cos * lean_cos * self.front.kappa_peak) {
+                front_limit = 0.0;
             }
-            // Anti-lock front: avoid wheel locking up at forward speed
-            let r_f = self.front.tyre.radius();
-            let v_front = fwd_speed.max(0.0);
-            if v_front > 3.0 && self.front.omega < (0.15 * v_front / r_f) {
-                front_lever *= 0.5;
+            if fast {
+                let (ff, fr) = (self.front.telemetry.load, self.rear.telemetry.load);
+                let mut stoppie = 1.0;
+                if ff + fr > 0.0 {
+                    let share = (ff / (ff + fr) * 2.0 - 1.0).max(0.0);
+                    let top = lean_cos.powi(200) * 0.3 + 0.7;
+                    if share > top {
+                        stoppie = 0.0;
+                    } else if share > top - 0.4 {
+                        stoppie = (top - share) / 0.4;
+                    }
+                }
+                front_limit = front_limit.min(stoppie);
+            }
+            let mut rear_limit = rear_lever;
+            if fast && self.rear.telemetry.slip_ratio < -(lean_cos * lean_cos * self.rear.kappa_peak) {
+                rear_limit = 0.0;
+            }
+            let [front_level, rear_level] = &mut self.brake_help_level;
+            for (level, limit, lever) in [(front_level, front_limit, &mut front_lever), (rear_level, rear_limit, &mut rear_lever)] {
+                *level = if limit >= *level { limit.min(*level + 6.0 * dt) } else { limit.max(*level - 1.2 * dt) };
+                *lever = lever.min(*level);
             }
         }
-        let brake = |w: &Wheel, lever: f32, extra: f32| -> f32 { w.brake_torque_max * lever.clamp(0.0, 1.0) + extra };
+        let brake = |w: &Wheel, lever: f32, extra: f32| -> f32 {
+            let dz = w.brake_dead_zone;
+            let travel = if lever >= dz { (lever - dz) / (1.0 - dz) } else { 0.0 };
+            w.brake_torque_max * travel.clamp(0.0, 1.0) + extra
+        };
         let fb = brake(&self.front, front_lever, 0.5);
         let rb = brake(&self.rear, rear_lever, 0.5);
         let spin_before = (self.front.omega, self.rear.omega);

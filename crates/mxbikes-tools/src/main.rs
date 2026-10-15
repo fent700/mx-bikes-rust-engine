@@ -475,6 +475,8 @@ fn sim(vfs: &MxBikesVfs, id: &str) -> i32 {
     let new_bike = || {
         let mut b = Motorcycle::new(def.clone(), tyres.clone(), Vec3::ZERO, 0.0);
         b.powertrain.auto_shift = false;
+        // Profile default (`brakehelp = 1`).
+        b.brake_help = true;
         b
     };
 
