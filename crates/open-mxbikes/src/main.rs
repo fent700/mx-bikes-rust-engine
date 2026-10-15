@@ -9,6 +9,7 @@ pub mod profile;
 pub mod rider;
 pub mod scene;
 pub mod session;
+pub mod settings;
 pub mod setup;
 pub mod terrain_material;
 pub mod ui;
@@ -16,13 +17,14 @@ pub mod world;
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-use bevy::window::{PresentMode, WindowResolution};
+use bevy::window::WindowResolution;
 use camera::FollowCamera;
 use mxbikes_vfs::MxBikesVfs;
 use std::sync::Arc;
 use world::{Atmosphere, LaunchOptions, Vfs};
 
 fn parse_args() -> (LaunchOptions, Option<String>) {
+    let saved = profile::Profile::load();
     let mut opts = LaunchOptions {
         // Like the game, start at the main menu over the menu background scene.
         track: "bg".into(),
@@ -32,11 +34,12 @@ fn parse_args() -> (LaunchOptions, Option<String>) {
         autopilot: false,
         autopilot_steer: 0.0,
         autopilot_throttle: 0.6,
-        autoshift: profile::Profile::load().i("aids", "autoshift") != 0,
+        autoshift: saved.i("aids", "autoshift") != 0,
         menu: None,
         paints: Default::default(),
-        number: String::new(),
-        rider_name: String::new(),
+        // Plate number and name from the profile (`info/race_number`, `info/name`).
+        number: saved.i("info", "race_number").to_string(),
+        rider_name: saved.str("info", "name"),
         font: "default_black".into(),
         dirt: None,
     };
@@ -95,12 +98,9 @@ fn main() {
         (x, y) if x >= 640.0 && y >= 480.0 => (x, y),
         _ => (1600.0, 900.0),
     };
-    let vsync = profile.i("gfx", "vsync") != 0;
-    let present_mode = if vsync {
-        PresentMode::AutoVsync
-    } else {
-        PresentMode::AutoNoVsync
-    };
+    let present_mode = settings::present_mode(&profile);
+    let window_mode = settings::window_mode(&profile);
+    settings::store_texture_settings(&profile);
 
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -108,6 +108,7 @@ fn main() {
                 title: "Open-MXBikes".into(),
                 resolution: WindowResolution::new(width, height),
                 present_mode,
+                mode: window_mode,
                 ..default()
             }),
             ..default()
@@ -157,7 +158,9 @@ fn main() {
         )
         .add_systems(Update, world::apply_setup.after(ui::handle_menu_interactions))
         .add_systems(Update, world::handle_session_reload.after(ui::handle_menu_interactions))
-        .add_systems(Update, ui::apply_graphics_settings.after(ui::handle_menu_interactions))
+        .add_systems(Startup, settings::request_initial_apply)
+        .add_systems(Update, settings::apply_graphics_settings.after(ui::handle_menu_interactions))
+        .add_systems(PostUpdate, settings::apply_display_ratio.after(bevy::render::camera::CameraUpdateSystem))
         .add_systems(Startup, engine_audio::setup_bike_sounds.after(world::setup_world))
         .add_systems(Startup, session::setup_session)
         .add_systems(Update, camera::onboard_visibility.after(camera::update_camera))
@@ -184,12 +187,7 @@ fn spawn_camera(
         _ => camera::CameraMode::Chase,
     };
     let fov_deg = profile.as_ref().map(|p| p.f("view", "fov")).filter(|&f| f >= 30.0 && f <= 150.0).unwrap_or(90.0);
-    let msaa = match profile.as_ref().map(|p| p.i("gfx", "multisample")).unwrap_or(0) {
-        1 => Msaa::Sample2,
-        2 => Msaa::Sample4,
-        3 => Msaa::Sample8,
-        _ => Msaa::Off,
-    };
+    let msaa = profile.as_ref().map(|p| settings::msaa(p)).unwrap_or(Msaa::Off);
     commands.spawn((
         Camera3d::default(),
         msaa,

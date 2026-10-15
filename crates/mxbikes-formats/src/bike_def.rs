@@ -262,6 +262,18 @@ pub struct BikeDefinition {
     pub geometry: BikeGeometry,
     pub tyres_type: String,
     pub autoclutch_rpm: (f32, f32),
+    pub shift_help: ShiftHelpDefinition,
+}
+
+/// `shifthelp` block of the bike `.cfg` (`FUN_14018ff80`): seconds and throttle openings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ShiftHelpDefinition {
+    pub declutch_time: f32,
+    pub reclutch_time: f32,
+    pub lift_time: f32,
+    pub lift_throttle: f32,
+    pub blip_time: f32,
+    pub blip_throttle: f32,
 }
 
 fn curve(engn: Option<&ConfigNode>, block: &str) -> Vec<(f32, f32)> {
@@ -555,6 +567,18 @@ impl BikeDefinition {
                 ac.and_then(|a| a.get_f32("minrpm")).unwrap_or(2500.0),
                 ac.and_then(|a| a.get_f32("maxrpm")).unwrap_or(3000.0),
             ),
+            shift_help: {
+                let sh = cfg.get_child("shifthelp");
+                let k = |n: &str| sh.and_then(|b| b.get_f32(n)).unwrap_or(0.0);
+                ShiftHelpDefinition {
+                    declutch_time: k("declutchtime"),
+                    reclutch_time: k("reclutchtime"),
+                    lift_time: k("lifttime"),
+                    lift_throttle: k("liftthrottle"),
+                    blip_time: k("bliptime"),
+                    blip_throttle: k("blipthrottle"),
+                }
+            },
         }
     }
 

@@ -834,18 +834,12 @@ fn spawn_bike(
     // `--dirt` sets the starting dirt amount (0.1666 / 0.5 / 0.8333 are the mud stage cuts).
     bike.dirt_factor = dirt_factor;
     bike.rider_dirt_factor = dirt_factor;
-    bike.powertrain.auto_shift = autoshift;
     if let Some(p) = profile {
-        bike.brake_help = p.i("aids", "brakehelp") != 0;
-        bike.traction_help = p.i("aids", "tractionhelp") != 0;
-        bike.rider.auto_lr_lean = p.i("aids", "autoriderlrlean") != 0;
-        let stab = if p.i("aids", "stabilityhelp") != 0 {
-            p.f("aids", "stabilityhelp_scale")
-        } else {
-            0.0
-        };
-        bike.stability_help_scale = stab;
+        p.apply_to_bike(&mut bike);
     }
+    // `--autoshift` / `--manual-shift` override the profile; autoshift forces shift help on.
+    bike.powertrain.auto_shift = autoshift;
+    bike.powertrain.shift_help |= autoshift;
     // Rider body slew rates from the rider parameters named by rider/rider.cfg `params`
     // (`FUN_140192ec0`); the RiderState defaults are the stock values if the file is missing.
     let prm_name = read_cfg(vfs, "rider/rider.cfg").and_then(|c| c.get_str("params").map(str::to_owned));
@@ -912,6 +906,7 @@ pub fn apply_setup(
     options: Res<LaunchOptions>,
     spawn: Option<Res<SpawnPoint>>,
     mut sim: Option<ResMut<BikeSim>>,
+    profile: Option<Res<crate::profile::Profile>>,
 ) {
     if !apply.0 {
         return;
@@ -941,11 +936,11 @@ pub fn apply_setup(
     bike.place_on(position, heading);
     bike.dirt_factor = old.dirt_factor;
     bike.rider_dirt_factor = old.rider_dirt_factor;
+    if let Some(p) = profile.as_ref() {
+        p.apply_to_bike(&mut bike);
+    }
     bike.powertrain.auto_shift = old.powertrain.auto_shift;
-    bike.brake_help = old.brake_help;
-    bike.traction_help = old.traction_help;
-    bike.stability_help_scale = old.stability_help_scale;
-    bike.rider.auto_lr_lean = old.rider.auto_lr_lean;
+    bike.powertrain.shift_help = old.powertrain.shift_help;
     bike.rider.lean_speed = old.rider.lean_speed;
     bike.rider.pitch_speed = old.rider.pitch_speed;
     sim.0 = bike;
@@ -1014,7 +1009,8 @@ pub fn update_lod_switching(
         if lod.levels.len() <= 1 {
             continue;
         }
-        let dist = transform.translation().distance(cam_pos);
+        // `gfx/detail_bias` moves the switch distances in (settings.rs).
+        let dist = transform.translation().distance(cam_pos) / crate::settings::lod_distance_scale().max(0.1);
         let mut active_idx = 0;
         for (i, (_, switch)) in lod.levels.iter().enumerate() {
             if dist >= *switch {

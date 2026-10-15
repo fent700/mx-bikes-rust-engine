@@ -125,6 +125,18 @@ impl Default for Profile {
 
 const SAVE_PATH: &str = "profile.ini";
 
+/// The input page's "current control" list (`FUN_1400cce50`): control and its label string.
+/// Tuning defaults are the stock keyboard table's (input.rs) and a zero dead zone / linearity.
+const CONTROL_LIST: &[(&str, &str, bool, f32, f32)] = &[
+    ("CTRL_LEAN", "Lean", true, 0.1, 0.1),
+    ("CTRL_THROTTLE", "Throttle", true, 0.3, 0.1),
+    ("CTRL_BRAKE", "Brake", true, 0.3, 0.1),
+    ("CTRL_REARBRAKE", "RearBrake", true, 0.3, 0.1),
+    ("CTRL_CLUTCH", "Clutch", true, 0.5, 0.05),
+    ("CTRL_FBLEAN", "rider_fb_lean", true, 0.8, 0.8),
+    ("CTRL_LRLEAN", "rider_lr_lean", true, 0.8, 0.8),
+];
+
 impl Profile {
     /// Defaults overlaid with a saved `profile.ini`, if any.
     pub fn load() -> Self {
@@ -158,6 +170,25 @@ impl Profile {
         }
     }
 
+    /// Hands the riding aids to the simulation, as `FUN_14006d050` passes them to the physics
+    /// every frame (ops 0x264 - 0x271).
+    pub fn apply_to_bike(&self, bike: &mut mxbikes_physics::Motorcycle) {
+        let on = |k: &str| self.i("aids", k) != 0;
+        bike.powertrain.auto_shift = on("autoshift");
+        // Autoshift forces shift help on (op 0x270).
+        bike.powertrain.shift_help = on("shifthelp") || on("autoshift");
+        bike.powertrain.auto_clutch = on("autoclutch");
+        bike.brake_help = on("brakehelp");
+        bike.traction_help = on("tractionhelp");
+        bike.lean_help = self.i("aids", "leanhelp").clamp(0, 3) as u32;
+        bike.lean_help_scale = self.f("aids", "leanhelp_scale");
+        bike.rider.auto_lr_lean = on("autoriderlrlean");
+        bike.rider.auto_fb_lean = on("autoriderfblean");
+        bike.rider.auto_sit = on("autoridersit");
+        bike.deformation_multiplier = self.f("testing", "deformation_multiplier").max(0.0);
+        bike.stability_help_scale = if on("stabilityhelp") { self.f("aids", "stabilityhelp_scale") } else { 0.0 };
+    }
+
     /// Profile name (`info/name`).
     pub fn name(&self) -> String {
         let n = self.str("info", "name");
@@ -166,6 +197,25 @@ impl Profile {
 
     pub fn f(&self, s: &str, k: &str) -> f32 {
         self.values.get(&(s.to_string(), k.to_ascii_lowercase())).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    }
+
+    /// Value of a key that may be absent.
+    pub fn opt_f(&self, s: &str, k: &str) -> Option<f32> {
+        self.values.get(&(s.to_string(), k.to_ascii_lowercase())).and_then(|v| v.parse().ok())
+    }
+
+    /// Control picked in the input page's "current control" list, as its control name.
+    fn cur_control(&self) -> &'static str {
+        CONTROL_LIST[self.i("input", "cur_control").clamp(0, CONTROL_LIST.len() as i64 - 1) as usize].0
+    }
+
+    fn tuning(&self, field: &str, default: f32) -> f32 {
+        self.opt_f("input", &format!("{}_{field}", self.cur_control().to_ascii_lowercase())).unwrap_or(default)
+    }
+
+    fn set_tuning(&mut self, field: &str, v: f32) {
+        let key = format!("{}_{field}", self.cur_control().to_ascii_lowercase());
+        self.set("input", &key, v);
     }
 
     pub fn i(&self, s: &str, k: &str) -> i64 {
@@ -345,6 +395,45 @@ impl Profile {
             // Input pages (`FUN_1400cce50`, `FUN_1400cff70`).
             "id_rumble" => check(self.i("input", "rumble") != 0),
             "id_combinedbrakes" => check(self.i("input", "combined_brakes") != 0),
+            // Current control tuning (`FUN_1400cbde0`): dead zone 0..50 %, linearity slider
+            // 0..100 for 2..0 and 100..200 for 0..-0.5, keyboard smoothing press / release as
+            // (10 - rate) / 7 in percent.
+            "id_curcontrol" => pull(CONTROL_LIST.iter().map(|c| t(c.1)).collect(), self.i("input", "cur_control").clamp(0, 6) as usize),
+            "id_deadzone" => slider((self.tuning("deadzone", 0.0) * 100.0).round() as i64, 50),
+            "id_deadzone_label" => pct((self.tuning("deadzone", 0.0) * 100.0).round() as i64),
+            "id_linearity" => {
+                let l = self.tuning("linearity", 0.0);
+                slider(if l >= 0.0 { ((1.0 - l * 0.5) * 100.0).round() as i64 } else { (-l * 200.0).round() as i64 + 100 }, 200)
+            }
+            "id_linearity_label" => text(format!("{:.2}", self.tuning("linearity", 0.0))),
+            "id_smooth" => {
+                let c = CONTROL_LIST[self.i("input", "cur_control").clamp(0, 6) as usize];
+                check(self.tuning("smooth", if c.2 { 1.0 } else { 0.0 }) != 0.0)
+            }
+            "id_smoothpress" => {
+                let c = CONTROL_LIST[self.i("input", "cur_control").clamp(0, 6) as usize];
+                slider((self.tuning("press", c.3) * 100.0).round() as i64, 100)
+            }
+            "id_smoothpress_label" => {
+                let c = CONTROL_LIST[self.i("input", "cur_control").clamp(0, 6) as usize];
+                pct((self.tuning("press", c.3) * 100.0).round() as i64)
+            }
+            "id_smoothrelease" => {
+                let c = CONTROL_LIST[self.i("input", "cur_control").clamp(0, 6) as usize];
+                slider((self.tuning("release", c.4) * 100.0).round() as i64, 100)
+            }
+            "id_smoothrelease_label" => {
+                let c = CONTROL_LIST[self.i("input", "cur_control").clamp(0, 6) as usize];
+                pct((self.tuning("release", c.4) * 100.0).round() as i64)
+            }
+            // Direct lean is the lean help return rate (`aids/leanhelp_scale` in percent).
+            "id_directlean" => slider((self.f("aids", "leanhelp_scale") * 100.0).round() as i64, 100),
+            "id_directlean_label" => pct((self.f("aids", "leanhelp_scale") * 100.0).round() as i64),
+            // Combined brakes range (`FUN_1400cce50`): min in 50 steps of 1 %, max 50 % + 150 steps.
+            "id_combinedbrakes_min" => slider((self.f("input", "combined_brakes_min") * 100.0).round() as i64, 50),
+            "id_combinedbrakes_min_label" => pct((self.f("input", "combined_brakes_min") * 100.0).round() as i64),
+            "id_combinedbrakes_max" => slider(((self.f("input", "combined_brakes_max") - 0.5) * 100.0).round() as i64, 150),
+            "id_combinedbrakes_max_label" => pct((self.f("input", "combined_brakes_max") * 100.0).round() as i64),
             "id_preload" => check(self.i("input", "gearbox_preload") != 0),
             "id_sitdirect" => check(self.i("input", "sit_direct") != 0),
             "id_lead" => slider(((self.f("testing", "trainer_lead") + 1.0) * 100.0).round() as i64, 200),
@@ -402,6 +491,12 @@ impl Profile {
             "id_combinedbrakes" => ("input", "combined_brakes"),
             "id_preload" => ("input", "gearbox_preload"),
             "id_sitdirect" => ("input", "sit_direct"),
+            "id_smooth" => {
+                let c = CONTROL_LIST[self.i("input", "cur_control").clamp(0, 6) as usize];
+                let on = self.tuning("smooth", if c.2 { 1.0 } else { 0.0 }) != 0.0;
+                self.set_tuning("smooth", if on { 0.0 } else { 1.0 });
+                return true;
+            }
             _ => return false,
         };
         self.flip(s, k);
@@ -528,6 +623,13 @@ impl Profile {
             "id_extviewheight" => self.set("ext_view", "height", p / 100.0),
             "id_extviewlatoff" => self.set("ext_view", "latoffset", (p - 100.0) / 100.0 * 1.5),
             "id_lead" => self.set("testing", "trainer_lead", p / 100.0 - 1.0),
+            "id_combinedbrakes_min" => self.set("input", "combined_brakes_min", p / 100.0),
+            "id_deadzone" => self.set_tuning("deadzone", p / 100.0),
+            "id_linearity" => self.set_tuning("linearity", if pos <= 100 { (1.0 - p / 100.0) * 2.0 } else { -(p - 100.0) / 200.0 }),
+            "id_smoothpress" => self.set_tuning("press", p / 100.0),
+            "id_smoothrelease" => self.set_tuning("release", p / 100.0),
+            "id_directlean" => self.set("aids", "leanhelp_scale", p / 100.0),
+            "id_combinedbrakes_max" => self.set("input", "combined_brakes_max", p / 100.0 + 0.5),
             _ => return false,
         }
         true
@@ -539,6 +641,7 @@ impl Profile {
             "id_fullscreen" => self.set("gfx", "fullscreen", [1, 2, 0][index.min(2)]),
             "id_screenratio" => self.set("gfx", "display_ratio", index.min(5)),
             "id_flags" => self.set("misc", "flags", index.min(2)),
+            "id_curcontrol" => self.set("input", "cur_control", index.min(CONTROL_LIST.len() - 1)),
             // Entries are sorted profile names; the name is stored.
             "id_controllerprofile" => return false,
             _ => return false,

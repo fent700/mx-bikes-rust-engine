@@ -48,14 +48,17 @@ pub fn sampler(repeat: bool) -> ImageSampler {
     } else {
         ImageAddressMode::ClampToEdge
     };
+    // Mip filter and anisotropy follow the texture filter settings (`gfx/texturefilter`,
+    // `gfx/anisotropic`).
+    let (mipmap_filter, anisotropy_clamp) = crate::settings::filtering();
     ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: mode,
         address_mode_v: mode,
         address_mode_w: mode,
         mag_filter: ImageFilterMode::Linear,
         min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        anisotropy_clamp: 16,
+        mipmap_filter,
+        anisotropy_clamp,
         ..default()
     })
 }
@@ -63,7 +66,21 @@ pub fn sampler(repeat: bool) -> ImageSampler {
 /// Uploads a decoded RGBA image with mipmaps.
 pub fn rgba_image(img: &DecodedImage, srgb: bool, repeat: bool) -> Image {
     let layer = (img.width * img.height * 4) as usize;
-    let (data, levels) = build_mips(img.width, img.height, &img.rgba[..layer], 4);
+    let (mut data, mut levels) = build_mips(img.width, img.height, &img.rgba[..layer], 4);
+    let (mut width, mut height) = (img.width, img.height);
+    // `gfx/texturesize`: world (repeating) textures drop their top mip levels. INFERRED: the
+    // game's 0 / 40 / 80 steps are taken as 0 / 1 / 2 halvings.
+    if repeat {
+        for _ in 0..crate::settings::texture_skip() {
+            if levels <= 1 || width < 64 || height < 64 {
+                break;
+            }
+            data.drain(..(width * height * 4) as usize);
+            width /= 2;
+            height /= 2;
+            levels -= 1;
+        }
+    }
     let format = if srgb {
         TextureFormat::Rgba8UnormSrgb
     } else {
@@ -76,8 +93,8 @@ pub fn rgba_image(img: &DecodedImage, srgb: bool, repeat: bool) -> Image {
     };
     image.texture_descriptor.dimension = TextureDimension::D2;
     image.texture_descriptor.size = Extent3d {
-        width: img.width,
-        height: img.height,
+        width,
+        height,
         depth_or_array_layers: 1,
     };
     image.texture_descriptor.format = format;

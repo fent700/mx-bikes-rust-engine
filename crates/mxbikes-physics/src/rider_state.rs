@@ -54,6 +54,11 @@ pub struct RiderState {
     /// Profile aid `autoriderlrlean` (inferred mapping of flag +0x23994 bit 0): the steer input is
     /// added to the lateral lean input.
     pub auto_lr_lean: bool,
+    /// Profile aid `autoridersit` (bike + 0x2399c): stand is pulled down beyond 30 deg of lean.
+    pub auto_sit: bool,
+    /// Profile aid `autoriderfblean` (bike + 0x23994 bit 2): automatic fore / aft target; off,
+    /// the stick sets it (twice the input forward on the ground).
+    pub auto_fb_lean: bool,
     /// Torso lean slew rate (+0x23780 from `rider.prm`).
     pub lean_speed: f32,
     /// Fore/aft pitch slew rate (+0x23784 from `rider.prm`).
@@ -84,6 +89,8 @@ impl Default for RiderState {
             roll_deg: 0.0,
             steer_rot_deg: 0.0,
             auto_lr_lean: true,
+            auto_sit: true,
+            auto_fb_lean: true,
             lean_speed,
             pitch_speed,
             force_history: [Vec3::ZERO; 25],
@@ -117,9 +124,11 @@ impl RiderState {
 
     pub fn reset(&mut self) {
         let params = self.params.clone();
-        let auto_lr = self.auto_lr_lean;
+        let (auto_lr, auto_sit, auto_fb) = (self.auto_lr_lean, self.auto_sit, self.auto_fb_lean);
         *self = Self::with_params(params);
         self.auto_lr_lean = auto_lr;
+        self.auto_sit = auto_sit;
+        self.auto_fb_lean = auto_fb;
     }
 
     /// Advances rider states by `dt`. Returns the rider mass offset `(lateral, longitudinal)` in metres.
@@ -144,7 +153,7 @@ impl RiderState {
         } else {
             ((speed - 1.5) / 1.5).min(1.0)
         };
-        let lean_factor = if !airborne_now && lean_deg.abs() >= 30.0 {
+        let lean_factor = if self.auto_sit && !airborne_now && lean_deg.abs() >= 30.0 {
             (1.0 - (lean_deg.abs() - 27.0) / 18.0).max(0.0)
         } else {
             1.0
@@ -193,8 +202,17 @@ impl RiderState {
         } else {
             target_pitch = (1.0 - target_pitch) * cmd_pitch + target_pitch;
         }
-        self.fore_aft_target = target_pitch.clamp(-1.0, 1.0);
-        slew(&mut self.fore_aft, self.fore_aft_target, self.pitch_speed, dt);
+        if self.auto_fb_lean {
+            self.fore_aft_target = target_pitch.clamp(-1.0, 1.0);
+            slew(&mut self.fore_aft, self.fore_aft_target, self.pitch_speed, dt);
+        } else if airborne_now {
+            self.fore_aft_target = cmd_pitch;
+            slew(&mut self.fore_aft, self.fore_aft_target, self.pitch_speed, dt);
+        } else {
+            // Manual: forward input counts double on the ground, slewed at 4 / s.
+            self.fore_aft_target = if cmd_pitch >= 0.0 { (cmd_pitch * 2.0).min(1.0) } else { cmd_pitch };
+            slew(&mut self.fore_aft, self.fore_aft_target, 4.0, dt);
+        }
 
         // 4. Torso lateral lean (FUN_1401a8480 lines 112-124 / 651-665)
         if self.auto_lr_lean {

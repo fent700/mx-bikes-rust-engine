@@ -730,7 +730,52 @@ fn spawn_text(
 }
 
 /// Items not drawn in single player: the multiplayer join button sits on the To Track rect.
-const HIDDEN_ITEMS: [&str; 1] = ["id_join"];
+/// Items for features this build does not have: multiplayer (join, connection, chat, names,
+/// flags), the trainer, track screens / 3D grass / reflections / shader toggle, refresh rate and
+/// colour depth (not selectable with the window library), head tracking and free look, force
+/// feedback, rumble, gearbox preload, the intro movie, dates (replays are not implemented), track
+/// help, the rider stand indicator, automatic tyre change and look-to-apex. Per dialog, because
+/// label names such as `ID_TEXT1` repeat across dialogs.
+fn hidden_item(dialog: &str, item: &str) -> bool {
+    const ANY: &[&str] = &["id_join", "id_trainer"];
+    const LIST: &[(&str, &[&str])] = &[
+        (
+            "idd_graphic_options",
+            &[
+                "id_bpptext", "id_bpp", "id_refresh_text", "id_frequency", "id_bikesreflection", "id_shaders", "id_3dgrass",
+                "id_trackscreens", "id_text1", "id_terraindetailbias", "id_terraindetailbias_label",
+            ],
+        ),
+        (
+            "idd_input_options",
+            &[
+                "id_text13", "id_ridertracking", "id_rumble", "id_text9", "id_gain_label", "id_gain", "id_text6", "id_ffenable",
+                "id_ffstrength_label", "id_text7", "id_ffstrength", "id_ffreverse",
+            ],
+        ),
+        ("idd_input2_options", &["id_preload", "id_chatlabel", "id_chat", "id_chat_state"]),
+        (
+            "idd_misc_options",
+            &[
+                "id_multitext", "id_multiconntext", "id_conn_type", "id_autochattext", "id_datetext", "id_date1", "id_date2",
+                "id_date3", "id_text", "id_skipintro", "id_drivingchat", "id_text3", "id_flags", "id_text1", "id_hidenames",
+                "id_text2", "id_trackhelp", "id_pitenvironmentsounds", "id_remotebikesvolumetext", "id_remotebikesvolumelabel",
+                "id_remotebikesvolume",
+            ],
+        ),
+        (
+            "idd_others_options",
+            &[
+                "id_freelook", "id_trackir", "id_tracking", "id_facetracking", "id_mouselook", "id_joystick", "id_looktoapex",
+                "id_corneranticipation_label", "id_corneranticipationscale", "id_showriderstand", "id_autotyreschange",
+            ],
+        ),
+    ];
+    if ANY.contains(&item) || (dialog == "idd_misc_options" && item.starts_with("id_autochat")) {
+        return true;
+    }
+    LIST.iter().any(|(d, items)| *d == dialog && items.contains(&item))
+}
 
 struct Ctx<'a, 'w, 's> {
     commands: &'a mut Commands<'w, 's>,
@@ -792,9 +837,10 @@ fn fl(n: &MenuNode, key: &str, default: f32) -> f32 {
 }
 
 fn spawn_dialog(ctx: &mut Ctx, root: Entity, dialog: &MenuNode, values: &Values, ui_state: &UiState, file: &str) {
+    let dialog_name = dialog.get_str("name").unwrap_or("").to_ascii_lowercase();
     for item in &dialog.children {
         let name = item.get_str("name").unwrap_or("").to_ascii_lowercase();
-        if HIDDEN_ITEMS.contains(&name.as_str()) {
+        if hidden_item(&dialog_name, &name) {
             continue;
         }
         let value = values.get(&name);
@@ -1227,6 +1273,11 @@ pub fn handle_menu_interactions(
     let settings = matches!(*ui_mode, UiMode::Settings | UiMode::Pit);
     let save_now = *ui_mode == UiMode::Pit;
     let in_menu_scene = options.track == "bg" || options.track == "menu";
+    // Menu sounds play at master x UI volume (`sound/master_volume`, `sound/ui_volume`).
+    let ui_gain = profile.as_ref().map(|p| p.f("sound", "master_volume") * p.f("sound", "ui_volume")).unwrap_or(0.5);
+    let ui_sound = |h: Handle<AudioSource>| {
+        (AudioPlayer::new(h), PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::new(ui_gain)))
+    };
     for (interaction, button, mut image) in &mut buttons {
         let state = match interaction {
             Interaction::None => 0,
@@ -1247,14 +1298,14 @@ pub fn handle_menu_interactions(
         }
         if *interaction == Interaction::Hovered {
             if let Some(ref s1) = button.sample1 {
-                commands.spawn(AudioPlayer::new(s1.clone()));
+                commands.spawn(ui_sound(s1.clone()));
             }
         }
         if *interaction != Interaction::Pressed {
             continue;
         }
         if let Some(ref s2) = button.sample2 {
-            commands.spawn(AudioPlayer::new(s2.clone()));
+            commands.spawn(ui_sound(s2.clone()));
         }
         match &button.action {
             Action::EditBox(item) => {
@@ -1369,6 +1420,11 @@ pub fn handle_menu_interactions(
                         }
                     }
                     "id_start" if choosing => {
+                        // The session's deformation is kept in the profile's testing section.
+                        if let (Some(s), Some(p)) = (session.as_ref(), profile.as_mut()) {
+                            p.set("testing", "deformation_multiplier", s.deformation);
+                            p.save();
+                        }
                         if let Some(s) = session.as_ref() {
                             if let Some((track, bike, paints)) = s.session_params() {
                                 reload_events.send(crate::world::ReloadSession { track, bike, paints });
@@ -1472,18 +1528,8 @@ pub fn handle_menu_interactions(
                         if settings {
                             if let Some(p) = profile.as_ref() {
                                 p.save();
-                                // Aids the simulation has: autoshift, lean aid, brake help, traction help, stability help.
                                 if let Some(sim) = sim.as_mut() {
-                                    sim.0.powertrain.auto_shift = p.i("aids", "autoshift") != 0;
-                                    sim.0.rider.auto_lr_lean = p.i("aids", "autoriderlrlean") != 0;
-                                    sim.0.brake_help = p.i("aids", "brakehelp") != 0;
-                                    sim.0.traction_help = p.i("aids", "tractionhelp") != 0;
-                                    let stab = if p.i("aids", "stabilityhelp") != 0 {
-                                        p.f("aids", "stabilityhelp_scale")
-                                    } else {
-                                        0.0
-                                    };
-                                    sim.0.stability_help_scale = stab;
+                                    p.apply_to_bike(&mut sim.0);
                                 }
                             }
                             apply_graphics.send(ApplyGraphicsSettings);
@@ -1720,58 +1766,3 @@ pub fn handle_editbox_input(
     }
 }
 
-/// Applies updated resolution, window mode, vsync, MSAA, FOV, and shadow settings
-/// dynamically to the Bevy window, camera, and world lights.
-pub fn apply_graphics_settings(
-    mut events: EventReader<ApplyGraphicsSettings>,
-    profile: Option<Res<Profile>>,
-    mut windows: Query<&mut Window>,
-    mut cameras: Query<(&mut PerspectiveProjection, Option<&mut Msaa>), With<Camera3d>>,
-    mut lights: Query<&mut DirectionalLight>,
-) {
-    if events.read().next().is_none() {
-        return;
-    }
-    let Some(profile) = profile else { return };
-    let Ok(mut window) = windows.get_single_mut() else { return };
-
-    let (width, height) = (profile.f("gfx", "x"), profile.f("gfx", "y"));
-    if width >= 640.0 && height >= 480.0 {
-        window.resolution.set(width, height);
-    }
-
-    let mode = match profile.i("gfx", "fullscreen") {
-        1 => bevy::window::WindowMode::Fullscreen(MonitorSelection::Current),
-        2 => bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Current),
-        _ => bevy::window::WindowMode::Windowed,
-    };
-    window.mode = mode;
-
-    let vsync = profile.i("gfx", "vsync") != 0;
-    window.present_mode = if vsync {
-        bevy::window::PresentMode::AutoVsync
-    } else {
-        bevy::window::PresentMode::AutoNoVsync
-    };
-
-    let fov = (profile.i("view", "fov") as f32).clamp(10.0, 170.0).to_radians();
-    let msaa_val = profile.i("gfx", "multisample");
-    let target_msaa = match msaa_val {
-        0 => Msaa::Off,
-        2 => Msaa::Sample2,
-        4 => Msaa::Sample4,
-        8 => Msaa::Sample8,
-        _ => Msaa::Sample4,
-    };
-    for (mut proj, msaa_opt) in cameras.iter_mut() {
-        proj.fov = fov;
-        if let Some(mut m) = msaa_opt {
-            *m = target_msaa;
-        }
-    }
-
-    let shadows = profile.i("gfx", "shadow_disable") == 0;
-    for mut light in lights.iter_mut() {
-        light.shadows_enabled = shadows;
-    }
-}

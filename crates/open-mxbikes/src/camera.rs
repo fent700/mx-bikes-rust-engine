@@ -9,6 +9,8 @@ pub struct FollowCamera {
     pub mode: CameraMode,
     /// Smoothed heading used by the chase camera (radians).
     heading: f32,
+    /// Onboard head yaw (deg), slewed at 600 deg/s.
+    head_yaw: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -48,7 +50,7 @@ pub enum CameraMode {
 
 impl FollowCamera {
     pub fn new(mode: CameraMode) -> Self {
-        Self { mode, heading: 0.0 }
+        Self { mode, heading: 0.0, head_yaw: 0.0 }
     }
 }
 
@@ -63,10 +65,28 @@ pub fn update_camera(
     sim: Res<BikeSim>,
     controls: Res<ControlState>,
     profile: Option<Res<crate::profile::Profile>>,
-    mut cams: Query<(&mut Transform, &mut FollowCamera)>,
+    mut cams: Query<(&mut Transform, &mut FollowCamera, &mut Projection)>,
     parts: Query<(&Name, &GlobalTransform), Without<FollowCamera>>,
 ) {
-    let Ok((mut t, mut cam)) = cams.get_single_mut() else { return };
+    let Ok((mut t, mut cam, mut projection)) = cams.get_single_mut() else { return };
+    let pf = |s: &str, k: &str, d: f32| profile.as_ref().map(|p| p.f(s, k)).unwrap_or(d);
+    let pi = |s: &str, k: &str, d: i64| profile.as_ref().map(|p| p.i(s, k)).unwrap_or(d);
+    // The helmet view uses the profile field of view; the chase view is fixed at 75 degrees
+    // (FUN_14000b7e0 writes 75.0 into the view for the external camera).
+    let fov_deg = match cam.mode {
+        CameraMode::Onboard => pf("view", "fov", 90.0).clamp(30.0, 150.0),
+        CameraMode::Chase => 75.0,
+        _ => pf("view", "fov", 90.0).clamp(30.0, 150.0),
+    };
+    if let Projection::Perspective(p) = projection.as_mut() {
+        if (p.fov - fov_deg.to_radians()).abs() > 1e-4 {
+            p.fov = fov_deg.to_radians();
+        }
+        let far = pf("gfx", "drawdistance", 1000.0).max(500.0);
+        if (p.far - far).abs() > 0.5 {
+            p.far = far;
+        }
+    }
     if controls.toggle_camera {
         cam.mode = match cam.mode {
             CameraMode::Chase => CameraMode::Onboard,
@@ -81,16 +101,46 @@ pub fn update_camera(
     let dt = time.delta_secs();
     match cam.mode {
         CameraMode::Chase => {
+            // External view (FUN_14000b7e0): a level frame along the bike's heading, or with
+            // `ext_view/mode` 1 along the direction of travel (blended in from 1 to 5 m/s). The
+            // camera sits 3.6 m + `distance` behind and 1.5 m + `height` above the midpoint of the
+            // axles (moved 70 % towards the bike and 0.7 m down with `follow_bike`), `latoffset`
+            // to the side, pitched down atan(height / (3.6 + distance)). `dynamic` adds
+            // 0.3 - speed / 30 m of distance. INFERRED: the heading is smoothed (the game reads an
+            // already filtered heading whose filter is not decoded), and the dynamic term's
+            // second input (camera struct + 0x5ec) is taken as zero.
             let fwd = rot * Vec3::NEG_Z;
-            let target_heading = fwd.x.atan2(-fwd.z);
+            let mut heading_dir = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or(Vec3::NEG_Z);
+            if pi("ext_view", "mode", 1) != 0 {
+                let vel = Vec3::new(bike.velocity.x, 0.0, bike.velocity.z);
+                let v = vel.length();
+                if v >= 5.0 {
+                    heading_dir = vel / v;
+                } else if v > 1.0 {
+                    let w = (v - 1.0) * 0.25;
+                    heading_dir = (vel / v * w + heading_dir * (1.0 - w)).normalize_or(heading_dir);
+                }
+            }
+            let target_heading = heading_dir.x.atan2(-heading_dir.z);
             let mut d = target_heading - cam.heading;
             d = d.sin().atan2(d.cos());
             cam.heading += d * (dt * 5.0).min(1.0);
             let dir = Vec3::new(cam.heading.sin(), 0.0, -cam.heading.cos());
-            let focus = origin + Vec3::Y * 1.0;
-            let desired = focus - dir * 4.0 + Vec3::Y * 1.2;
-            t.translation = t.translation.lerp(desired, (dt * 10.0).min(1.0));
-            t.look_at(focus + dir * 2.0, Vec3::Y);
+            let right = dir.cross(Vec3::Y);
+            let (front_axle, _) = bike.front_wheel_transform();
+            let (rear_axle, _) = bike.rear_axle_transform();
+            let mut pivot = (front_axle + rear_axle) * 0.5;
+            let follow = pi("ext_view", "follow_bike", 0) != 0;
+            if follow {
+                pivot = pivot.lerp(origin, 0.7);
+            }
+            let back = 3.6 + pf("ext_view", "distance", 0.0);
+            let height = pf("ext_view", "height", 0.3);
+            let dynamic = if pi("ext_view", "dynamic", 1) != 0 { 0.3 - bike.speed() / 30.0 } else { 0.0 };
+            let up = 1.5 + height - if follow { 0.7 } else { 0.0 };
+            t.translation = pivot + right * pf("ext_view", "latoffset", 0.0) + Vec3::Y * up - dir * (back - dynamic);
+            let pitch = height.atan2(back);
+            t.rotation = Quat::from_rotation_y(-cam.heading) * Quat::from_rotation_x(-pitch);
         }
         CameraMode::Onboard => {
             // Helmet view (FUN_14000b7e0): at the rider's head, raised by stand * 0.18 m, in the
@@ -101,13 +151,29 @@ pub fn update_camera(
             // The camera links to the helmet's `cam` object (`gfx.cfg` camlinkobj, at
             // (0.209, 0, -0.046) in the left-handed helmet frame); the helmet itself is hidden
             // (its cockpit model `c_helmet.edf` is empty).
-            let pitch = profile.as_ref().map(|p| p.f("view", "pitch")).unwrap_or(0.5);
+            let pitch = pf("view", "pitch", 0.5);
             let helmet = parts.iter().find(|(n, _)| n.as_str() == "helmet").map(|(_, g)| *g);
             t.translation = match helmet {
                 Some(g) => g.transform_point(Vec3::new(0.209, 0.0, 0.046)),
                 None => bike.rider_view_world() + rot * Vec3::Y * (bike.rider.stand * 0.18),
             };
-            t.rotation = rot * Quat::from_rotation_x(-(15.0 + 20.0 * pitch).to_radians());
+            // Corner anticipation:
+            // 1 = steer angle x corner_anticipation_scale
+            // 2 = lean heading: clamp(lean / 50, -1, 1) x lean_heading_scale
+            // Both slewed at 600 deg/s up to +-60 deg (FUN_14000b7e0 lines 200-244).
+            let yaw_target = match pi("view", "corner_anticipation", 0) {
+                1 => bike.steer_angle.to_degrees().clamp(-45.0, 45.0) * pf("view", "corner_anticipation_scale", 0.5),
+                2 => (bike.lean_angle_deg / 50.0).clamp(-1.0, 1.0) * pf("view", "lean_heading_scale", 35.0),
+                _ => 0.0,
+            };
+            let step = 600.0 * dt;
+            cam.head_yaw += (yaw_target.clamp(-60.0, 60.0) - cam.head_yaw).clamp(-step, step);
+            // `view/mode`: 0 keeps horizon level, 1 blends by `view/tilt` (0 horizon .. 1 bike roll).
+            let f = rot * Vec3::NEG_Z;
+            let horizon = Quat::from_rotation_y(f.x.atan2(-f.z) * -1.0) * Quat::from_rotation_x(f.y.clamp(-1.0, 1.0).asin());
+            let tilt = if pi("view", "mode", 1) == 0 { 0.0 } else { pf("view", "tilt", 0.5) };
+            let frame = horizon.slerp(rot, tilt);
+            t.rotation = frame * Quat::from_rotation_y(-cam.head_yaw.to_radians()) * Quat::from_rotation_x(-(15.0 + 20.0 * pitch).to_radians());
         }
         CameraMode::Side => {
             let right = rot * Vec3::X;

@@ -88,6 +88,8 @@ pub struct WheelTelemetry {
     /// Ground normal and rolling direction at the contact.
     pub normal: Vec3,
     pub rolling: Vec3,
+    /// Lateral friction coefficient of the last tyre evaluation.
+    pub mu_y: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -229,11 +231,19 @@ pub struct Motorcycle {
     /// Profile aid `brakehelp` (FUN_1401ada40): front release on lock-up or when the rear
     /// unloads, rear release on lock-up, both through a rate limiter.
     pub brake_help: bool,
+    /// Profile aid `leanhelp` bits (op 0x26d, bike + 0x23958) and `leanhelp_scale` (+ 0x2395c).
+    pub lean_help: u32,
+    pub lean_help_scale: f32,
     /// Profile aid `tractionhelp` (FUN_1401ada40): throttle limited down to 0.75 as rear slip
     /// passes 0.7 to 2.1 times the peak slip.
     pub traction_help: bool,
+    /// Testing session `Deformation` multiplier on rut digging (profile
+    /// `testing/deformation_multiplier`).
+    pub deformation_multiplier: f32,
     /// Brake help lever limits (rise 6/s, fall 1.2/s), front and rear.
     brake_help_level: [f32; 2],
+    /// Rear tyre road torque on the wheel from the last step, for the clutch's lock prediction.
+    last_rear_road_torque: f32,
     last_accel: Vec3,
     accumulator: f32,
     rut_accum: f32,
@@ -345,6 +355,10 @@ impl Motorcycle {
             brake_help: false,
             traction_help: false,
             brake_help_level: [0.0; 2],
+            deformation_multiplier: 1.0,
+            last_rear_road_torque: 0.0,
+            lean_help: 3,
+            lean_help_scale: 0.3,
             last_accel: Vec3::ZERO,
             accumulator: 0.0,
             rut_accum: 0.0,
@@ -684,6 +698,7 @@ impl Motorcycle {
             velocity: axle_vel,
             normal: n,
             rolling: long,
+            mu_y: f.mu_y,
         };
         Some(ContactResult {
             force: long * fx + lat * fy + n * fz,
@@ -745,6 +760,8 @@ impl Motorcycle {
         self.powertrain.starter = inp.starter;
         self.powertrain.road_speed = fwd_speed;
         self.powertrain.wheel_radius = self.rear.tyre.radius();
+        self.powertrain.wheel_inertia = self.rear.spin_inertia;
+        self.powertrain.wheel_load_torque = if self.rear.telemetry.contact.is_some() { self.last_rear_road_torque } else { 0.0 };
         self.powertrain.rear_airborne = self.rear.telemetry.contact.is_none();
         let drive_torque = self.powertrain.step(dt, self.rear.omega);
 
@@ -784,7 +801,7 @@ impl Motorcycle {
                     wheel.last_contact = Some(pt);
                     if v >= 0.1 {
                         let f = Vec3::new(t.fx, t.load, t.fy).length() + t.fx.abs();
-                        ground.deform(pt.x, pt.z, v * f.min(5000.0) * 4e-5 * rut_dt);
+                        ground.deform(pt.x, pt.z, v * f.min(5000.0) * 4e-5 * rut_dt * self.deformation_multiplier);
                     }
                 } else {
                     wheel.last_contact = None;
@@ -855,9 +872,19 @@ impl Motorcycle {
         let lock = st.lock_deg.to_radians();
         let front_load = fc.as_ref().map(|c| c.force.dot(fork_axis_w).max(0.0)).unwrap_or(0.0);
         let ground_n = ground.normal(self.com.x, self.com.z);
-        let grip = self.front.tyre.def.coef("p_Dy1").max(0.3)
-            * self.front.tyre.def.grip(ground.surface(self.com.x, self.com.z)).dry_grip
-            * self.front.grip_scale;
+        // The game reads the front tyre's last mu_y (bike + 0x12150).
+        let grip = if self.front.telemetry.mu_y > 0.0 {
+            self.front.telemetry.mu_y
+        } else {
+            self.front.tyre.def.coef("p_Dy1").max(0.3)
+                * self.front.tyre.def.grip(ground.surface(self.com.x, self.com.z)).dry_grip
+                * self.front.grip_scale
+        };
+        let loose_surface = self
+            .front
+            .telemetry
+            .surface
+            .is_some_and(|s| matches!(s.terrain_id(), 4 | 5 | 7 | 9 | 10 | 11 | 12 | 14));
         let ctrl_in = SteerInputs {
             dt,
             stick: inp.steer,
@@ -868,6 +895,9 @@ impl Motorcycle {
             bank: right.dot(ground_n).clamp(-1.0, 1.0).asin(),
             front_load,
             weight: self.mass * GRAVITY,
+            lean_help: self.lean_help,
+            lean_help_scale: self.lean_help_scale,
+            loose_surface,
         };
         // Below 1 m/s the game switches from the lean PID to pointing the bars at Lock * stick with
         // gains derived from the steering inertia (Kp = -600 I, Kd = 0.05 Kp, FUN_140197060), i.e.
@@ -927,6 +957,7 @@ impl Motorcycle {
             torque += (c.point - self.com).cross(c.force) + c.aligning;
             sw_torque += (-lat_w).dot((c.point - pivot_w).cross(c.force));
             rear_road_torque = c.road_torque;
+            self.last_rear_road_torque = c.road_torque;
         }
         let sw_cg = pivot_w + (ra_w - pivot_w) * 0.7;
         sw_torque += (-lat_w).dot((sw_cg - pivot_w).cross((g_vec - a_chassis) * self.swingarm_mass));

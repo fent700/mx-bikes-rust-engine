@@ -383,6 +383,7 @@ pub fn read_controls(
     pad_profile: Option<Res<PadProfile>>,
     bindings: Option<Res<Bindings>>,
     mut state: ResMut<ControlState>,
+    profile: Option<Res<crate::profile::Profile>>,
 ) {
     let dt = time.delta_secs();
     let bound = |c: &KeyControl| bindings.as_ref().and_then(|b| b.keys.get(c.name).copied()).unwrap_or(c.keys);
@@ -390,8 +391,13 @@ pub fn read_controls(
     let pressed_now = |code: u32| dik(code).is_some_and(|k| keys.just_pressed(k));
     let mut values: HashMap<&'static str, f32> = HashMap::new();
     let mut triggers: HashMap<&'static str, bool> = HashMap::new();
+    // Per-control tuning edited on the input page (profile `input/<control>_<field>`).
+    let tune = |name: &str, field: &str| profile.as_ref().and_then(|p| p.opt_f("input", &format!("{}_{field}", name.to_ascii_lowercase())));
     for c in KEYBOARD {
         let keys = bound(c);
+        let smooth = tune(c.name, "smooth").map(|v| v != 0.0).unwrap_or(c.smooth);
+        let press = tune(c.name, "press").unwrap_or(c.press);
+        let release = tune(c.name, "release").unwrap_or(c.release);
         match c.kind {
             Kind::Axis | Kind::TwoKeyAxis => {
                 let target = if c.kind == Kind::Axis {
@@ -399,14 +405,14 @@ pub fn read_controls(
                 } else {
                     (held(keys[1]) as i32 - held(keys[0]) as i32) as f32
                 };
-                let v = if c.smooth {
+                let v = if smooth {
                     let current = state.filtered.get(c.name).copied().unwrap_or(0.0);
                     // Moving away from rest uses the press rate, back towards rest the release
                     // rate; a two-key axis crossing zero uses the press rate.
                     let rate = if target.abs() > current.abs() || target * current < 0.0 {
-                        10.0 - 7.0 * c.press
+                        10.0 - 7.0 * press
                     } else {
-                        10.0 - 7.0 * c.release
+                        10.0 - 7.0 * release
                     };
                     let next = current + (target - current).clamp(-rate * dt, rate * dt);
                     state.filtered.insert(c.name, next);
@@ -418,6 +424,7 @@ pub fn read_controls(
             }
             Kind::Trigger => {
                 triggers.insert(c.name, pressed_now(keys[0]));
+                values.insert(c.name, if held(keys[0]) { 1.0 } else { 0.0 });
             }
             Kind::Hold => {
                 values.insert(c.name, if held(keys[0]) { 1.0 } else { 0.0 });
@@ -431,6 +438,14 @@ pub fn read_controls(
             for (name, c) in &profile.controls {
                 let Some(key) = KEYBOARD.iter().map(|k| k.name).find(|k| k == name) else { continue };
                 let id = KEYBOARD.iter().position(|k| k.name == key).unwrap_or(0) as u8;
+                let mut c = c.clone();
+                if let Some(d) = tune(key, "deadzone") {
+                    c.deadzone = d;
+                }
+                if let Some(l) = tune(key, "linearity") {
+                    c.linearity = l;
+                }
+                let c = &c;
                 let v = armed_value(&mut state.armed, entity, id, pad_value(pad, c), 0.0);
                 match c.kind.as_str() {
                     "button" | "pov" => {
@@ -471,22 +486,41 @@ pub fn read_controls(
 
     let v = |n: &str| values.get(n).copied().unwrap_or(0.0);
     let t = |n: &str| triggers.get(n).copied().unwrap_or(false);
-    if t("CTRL_SIT") {
+    // `input/sit_direct`: the sit control is held to stand; otherwise each press toggles
+    // (FUN_14006d050).
+    let profile_i = |k: &str| profile.as_ref().map(|p| p.i("input", k)).unwrap_or(0);
+    if profile_i("sit_direct") != 0 {
+        state.standing = v("CTRL_SIT") > 0.5;
+    } else if t("CTRL_SIT") {
         state.standing = !state.standing;
     }
+    // `input/combined_brakes`: the front lever also works the rear brake, from `min` lever
+    // travel up to `max` at full lever; the rear control can still ask for more.
+    let mut rear_brake = v("CTRL_REARBRAKE");
+    if profile_i("combined_brakes") != 0 {
+        let (min, max) = profile.as_ref().map(|p| (p.f("input", "combined_brakes_min"), p.f("input", "combined_brakes_max"))).unwrap_or((0.0, 1.0));
+        let front = v("CTRL_BRAKE");
+        let travel = if front <= min { 0.0 } else { (front - min) / (1.0 - min).max(1e-3) };
+        rear_brake = rear_brake.max(travel * max);
+    }
+    let (shift_up, shift_down) = if profile_i("gearbox_preload") != 0 {
+        (v("CTRL_SHIFTUP") > 0.5, v("CTRL_SHIFTDOWN") > 0.5)
+    } else {
+        (t("CTRL_SHIFTUP"), t("CTRL_SHIFTDOWN"))
+    };
     state.reset = t("CTRL_RESET");
     state.toggle_camera = t("CTRL_CHANGEVIEW");
     state.rider = RiderInput {
         steer: v("CTRL_LEAN"),
         throttle: v("CTRL_THROTTLE"),
         front_brake: v("CTRL_BRAKE"),
-        rear_brake: v("CTRL_REARBRAKE"),
+        rear_brake,
         clutch: v("CTRL_CLUTCH"),
         lean_forward: v("CTRL_FBLEAN"),
         lean_lateral: v("CTRL_LRLEAN"),
         stand: state.standing,
-        shift_up: t("CTRL_SHIFTUP"),
-        shift_down: t("CTRL_SHIFTDOWN"),
+        shift_up,
+        shift_down,
         starter: v("CTRL_STARTER") > 0.5,
     };
     if state.reset {

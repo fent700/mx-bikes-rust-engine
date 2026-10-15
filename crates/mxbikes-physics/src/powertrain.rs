@@ -4,7 +4,7 @@
 //! The clutch is a torque-limited coupling between the basket (crank / primary) and the gearbox
 //! input (wheel * final * gear); it slips whenever the transmitted torque exceeds its capacity.
 
-use mxbikes_formats::bike_def::{BikeDefinition, DrivelineDefinition, EngineDefinition, GearboxDefinition};
+use mxbikes_formats::bike_def::{BikeDefinition, DrivelineDefinition, EngineDefinition, GearboxDefinition, ShiftHelpDefinition};
 
 const RPM_TO_RAD: f32 = std::f32::consts::TAU / 60.0;
 
@@ -14,6 +14,7 @@ pub struct Powertrain {
     pub gearbox: GearboxDefinition,
     pub driveline: DrivelineDefinition,
     pub autoclutch_rpm: (f32, f32),
+    pub shift_help_def: ShiftHelpDefinition,
 
     /// Crank speed (rad/s).
     pub crank_omega: f32,
@@ -23,6 +24,13 @@ pub struct Powertrain {
     /// Rider lever: 0 released (engaged) .. 1 pulled.
     pub clutch_lever: f32,
     pub auto_clutch: bool,
+    /// Profile aid `shifthelp` (forced on with autoshift, op 0x270): clutch and throttle
+    /// handling around each shift (`FUN_1401ad620`).
+    pub shift_help: bool,
+    help_state: u8,
+    help_bits: u8,
+    help_up: bool,
+    help_t: f32,
     /// Automatic gearbox assist driven by the bike's `autoshift` rpm table.
     pub auto_shift: bool,
     pub stalled: bool,
@@ -35,6 +43,10 @@ pub struct Powertrain {
     /// Bike road speed (m/s) and rear tyre radius (m), for the autoshift speed checks.
     pub road_speed: f32,
     pub wheel_radius: f32,
+    /// Rear wheel spin inertia (kg m^2), the wheel side of the clutch coupling.
+    pub wheel_inertia: f32,
+    /// Other torque on the rear wheel this step (road), for the lock prediction (N m).
+    pub wheel_load_torque: f32,
     /// The rear wheel is off the ground (autoshift upshift speed allowance x0.7).
     pub rear_airborne: bool,
     pub clutch_slip: f32,
@@ -47,11 +59,17 @@ impl Powertrain {
             gearbox: def.gearbox.clone(),
             driveline: def.driveline.clone(),
             autoclutch_rpm: def.autoclutch_rpm,
+            shift_help_def: def.shift_help,
             crank_omega: def.engine.idle_rpm * RPM_TO_RAD,
             gear: 0,
             throttle: 0.0,
             clutch_lever: 0.0,
             auto_clutch: true,
+            shift_help: true,
+            help_state: 0,
+            help_bits: 0,
+            help_up: true,
+            help_t: 0.0,
             auto_shift: false,
             stalled: false,
             starter: false,
@@ -62,6 +80,8 @@ impl Powertrain {
             clutch_slip: 0.0,
             road_speed: 0.0,
             wheel_radius: 0.33,
+            wheel_inertia: 1.0,
+            wheel_load_torque: 0.0,
             rear_airborne: false,
         }
     }
@@ -114,6 +134,7 @@ impl Powertrain {
         self.gear = 0;
         self.pending_gear = None;
         self.shift_timer = 0.0;
+        self.help_state = 0;
         self.throttle = 0.0;
         self.clutch_lever = 0.0;
         self.stalled = false;
@@ -148,21 +169,124 @@ impl Powertrain {
         self.pending_gear.is_some()
     }
 
-    /// Sequential box: requests are ignored while a shift is still in progress.
+    /// Sequential box: requests are ignored while a shift is still in progress. With shift help
+    /// the request first runs the help's declutch / throttle lift phase.
     pub fn shift_up(&mut self) {
-        if self.pending_gear.is_some() {
-            return;
+        if self.shift_help {
+            self.start_help(true);
+        } else {
+            self.shift_now(true);
         }
-        let target = (self.gear + 1).min(self.gear_count());
-        self.request(target, self.gearbox.upshift_time);
     }
 
     pub fn shift_down(&mut self) {
+        if self.shift_help {
+            self.start_help(false);
+        } else {
+            self.shift_now(false);
+        }
+    }
+
+    fn shift_now(&mut self, up: bool) {
         if self.pending_gear.is_some() {
             return;
         }
-        let target = self.gear.saturating_sub(1);
-        self.request(target, self.gearbox.downshift_time);
+        if up {
+            let target = (self.gear + 1).min(self.gear_count());
+            self.request(target, self.gearbox.upshift_time);
+        } else {
+            let target = self.gear.saturating_sub(1);
+            self.request(target, self.gearbox.downshift_time);
+        }
+    }
+
+    /// Shift help start (`FUN_1401ad620`): bit 1 declutch, bit 2 throttle lift, bit 4 blip.
+    /// Up: declutch out of neutral, or out of first below 2.5 m/s; otherwise lift. Down: declutch
+    /// from neutral, nothing from first, declutch + lift from second below 2.5 m/s, otherwise
+    /// declutch + lift + blip. Requests arriving during the first two phases are dropped.
+    fn start_help(&mut self, up: bool) {
+        if matches!(self.help_state, 1 | 2) {
+            return;
+        }
+        let slow = self.road_speed.abs() < 2.5;
+        self.help_bits = match (up, self.gear) {
+            (true, 0) => 1,
+            (true, 1) if slow => 1,
+            (true, _) => 2,
+            (false, 0) => 1,
+            (false, 1) => 0,
+            (false, 2) if slow => 3,
+            (false, _) => 7,
+        };
+        self.help_up = up;
+        self.help_t = 0.0;
+        self.help_state = 1;
+    }
+
+    /// Advances shift help and returns the throttle and clutch lever it leaves.
+    fn run_help(&mut self, dt: f32, mut throttle: f32, mut lever: f32) -> (f32, f32) {
+        let d = self.shift_help_def;
+        let b = self.help_bits;
+        let ramp = |t: f32, len: f32| if len > 0.0 { (t / len).min(1.0) } else { 1.0 };
+        match self.help_state {
+            1 => {
+                let mut total: f32 = 0.0;
+                if b & 1 != 0 {
+                    total = d.declutch_time.max(0.0);
+                }
+                if b & 2 != 0 {
+                    total = total.max(d.lift_time);
+                }
+                if b & 1 != 0 {
+                    let start = total - d.declutch_time;
+                    let r = if start <= self.help_t && d.declutch_time > 0.0 { (self.help_t - start) / d.declutch_time } else { 0.0 };
+                    lever = lever.max(r);
+                }
+                if b & 2 != 0 {
+                    let start = total - d.lift_time;
+                    let r = if start <= self.help_t && d.lift_time > 0.0 { (self.help_t - start) / d.lift_time } else { 0.0 };
+                    throttle = throttle.min((1.0 - d.lift_throttle) * (1.0 - r) + d.lift_throttle);
+                }
+                self.help_t += dt;
+                if total < self.help_t {
+                    self.help_state = 2;
+                    self.shift_now(self.help_up);
+                }
+            }
+            2 => {
+                if b & 1 != 0 {
+                    lever = 1.0;
+                }
+                if b & 2 != 0 {
+                    throttle = throttle.min(d.lift_throttle);
+                }
+                if self.pending_gear.is_none() {
+                    self.help_state = 4;
+                    self.help_t = 0.0;
+                }
+            }
+            4 => {
+                let mut total: f32 = 0.0;
+                if b & 1 != 0 {
+                    total = d.reclutch_time.max(0.0);
+                    lever = lever.max(1.0 - ramp(self.help_t, d.reclutch_time));
+                }
+                if b & 2 != 0 {
+                    total = total.max(d.lift_time);
+                    throttle = throttle.min((1.0 - d.lift_throttle) * ramp(self.help_t, d.lift_time) + d.lift_throttle);
+                }
+                if b & 4 != 0 {
+                    total = total.max(d.blip_time);
+                    throttle = throttle.max((1.0 - ramp(self.help_t, d.blip_time)) * d.blip_throttle);
+                }
+                self.help_t += dt;
+                if total < self.help_t {
+                    self.help_state = 0;
+                }
+            }
+            _ => {}
+        }
+        (throttle, lever)
     }
 
     fn request(&mut self, target: usize, time: f32) {
@@ -203,17 +327,24 @@ impl Powertrain {
         full * t + drag * (1.0 - t)
     }
 
-    /// Clutch engagement 0..1 from lever, dead zone and the auto clutch rpm window.
-    fn engagement(&self) -> f32 {
+    /// Clutch engagement 0..1 from the lever after its dead zone.
+    fn engagement(&self, lever: f32) -> f32 {
         let dz = self.engine.clutch.dead_zone.clamp(0.0, 0.95);
-        let lever = ((self.clutch_lever - dz) / (1.0 - dz)).clamp(0.0, 1.0);
-        let mut e = 1.0 - lever;
-        if self.auto_clutch {
-            let (lo, hi) = self.autoclutch_rpm;
-            let a = ((self.rpm() - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
-            e = e.min(a);
+        1.0 - ((lever - dz) / (1.0 - dz)).clamp(0.0, 1.0)
+    }
+
+    /// Autoclutch (`FUN_1401ada40`): at or below MinRPM the lever is pulled fully; up to MaxRPM
+    /// it is held at least at 1 - (rpm - min) / (max - min).
+    fn auto_clutch_lever(&self, lever: f32) -> f32 {
+        let (lo, hi) = self.autoclutch_rpm;
+        let rpm = self.rpm();
+        if !self.auto_clutch || rpm >= hi {
+            lever
+        } else if rpm <= lo {
+            1.0
+        } else {
+            lever.max(1.0 - (rpm - lo) / (hi - lo))
         }
-        e
     }
 
     /// Advances the drivetrain. `wheel_omega` is the rear wheel spin (rad/s, positive forward).
@@ -230,6 +361,8 @@ impl Powertrain {
         if self.auto_shift && self.pending_gear.is_none() && !self.stalled {
             self.autoshift();
         }
+        let lever = self.auto_clutch_lever(self.clutch_lever);
+        let (throttle, lever) = if self.shift_help { self.run_help(dt, self.throttle, lever) } else { (self.throttle, lever) };
         let rpm = self.rpm();
         if rpm >= self.engine.limiter_rpm {
             self.limiter_cut = true;
@@ -250,7 +383,7 @@ impl Powertrain {
 
         // The throttle never closes below the idle opening; idle speed is where that opening's
         // combustion torque balances the friction curve.
-        let eff_throttle = self.throttle.clamp(0.0, 1.0).max(self.engine.idle_throttle);
+        let eff_throttle = throttle.clamp(0.0, 1.0).max(self.engine.idle_throttle);
         let mut crank = self.crank_torque(eff_throttle);
         if self.starter && rpm < self.engine.starter_max_rpm {
             crank += self.engine.starter_torque;
@@ -262,14 +395,24 @@ impl Powertrain {
         let basket_omega = self.crank_omega / primary;
         let input_omega = wheel_omega * final_ratio * gear;
 
-        let engagement = if gear > 0.0 { self.engagement() } else { 0.0 };
+        let engagement = if gear > 0.0 { self.engagement(lever) } else { 0.0 };
         let capacity = self.engine.clutch.max_torque * engagement;
         let crank_inertia = self.engine.inertia + self.driveline.first_axis_inertia;
         let basket_inertia = crank_inertia * primary * primary;
 
-        // Torque needed at the basket to lock both sides within this step, limited by capacity.
+        // Torque that brings both sides of the clutch to one speed within this step, limited by
+        // capacity. Both sides move: the basket (crank through the primary) and the gearbox input
+        // (rear wheel spin through gear and final drive). Using the basket side alone overshoots
+        // and makes the clutch chatter between +- capacity.
+        // The engine's own torque this step is included, so a clutch with spare capacity holds
+        // both sides at one speed instead of trailing a step behind.
         let slip = basket_omega - input_omega;
-        let lock_torque = slip * basket_inertia / dt.max(1e-5);
+        let drive_ratio = final_ratio * gear;
+        let slip_next = slip + crank * primary / basket_inertia * dt
+            - self.wheel_load_torque / self.wheel_inertia.max(1e-3) * dt * drive_ratio;
+        let input_inertia = if drive_ratio > 0.0 { self.wheel_inertia / (drive_ratio * drive_ratio) } else { f32::INFINITY };
+        let coupled_inertia = 1.0 / (1.0 / basket_inertia + 1.0 / input_inertia);
+        let lock_torque = slip_next * coupled_inertia / dt.max(1e-5);
         let clutch_torque = lock_torque.clamp(-capacity, capacity);
         self.clutch_slip = slip;
 

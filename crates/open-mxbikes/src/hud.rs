@@ -36,8 +36,25 @@ pub fn update_hud(
     timer: Option<Res<crate::world::LapTimer>>,
     ui_mode: Option<Res<crate::ui::UiMode>>,
     mut q: Query<&mut Text, With<HudText>>,
+    profile: Option<Res<crate::profile::Profile>>,
+    cams: Query<&crate::camera::FollowCamera>,
+    time: Res<Time>,
+    mut fps: Local<f32>,
 ) {
     let Ok(mut text) = q.get_single_mut() else { return };
+    let dt = time.delta_secs();
+    if dt > 0.0 {
+        *fps = if *fps <= 0.0 { 1.0 / dt } else { *fps * 0.95 + 0.05 / dt };
+    }
+    let pi = |s: &str, k: &str| profile.as_ref().map(|p| p.i(s, k)).unwrap_or(0);
+    let fps_line = if pi("misc", "showfps") != 0 { format!("{:.0} fps
+", *fps) } else { String::new() };
+    // In the helmet view the HUD shows only with `view/show_HUD` (FUN_1400f32b0).
+    let onboard = cams.get_single().is_ok_and(|c| matches!(c.mode, crate::camera::CameraMode::Onboard));
+    if onboard && pi("view", "show_hud") == 0 {
+        text.0 = fps_line;
+        return;
+    }
     if let Some(mode) = ui_mode {
         if *mode != crate::ui::UiMode::None {
             text.0.clear();
@@ -76,12 +93,21 @@ pub fn update_hud(
         String::new()
     };
 
-    text.0 = format!(
-        "{:5.1} km/h   gear {gear}   {:5.0} rpm{}{}{}\nlean {:5.1} deg   fork {:3.0} mm   shock {:3.0} mm   rear slip {:+.2}   {surface}{}{timing_str}",
-        b.speed_kmh,
+    let stand_str = if pi("view", "show_riderstand") != 0 {
+        if b.rider.stand > 0.5 { "   [STAND]" } else { "   [SIT]" }
+    } else {
+        ""
+    };
+
+    // `misc/units`: 0 metric, 1 US and 2 UK both show miles per hour.
+    let (speed, unit) = if pi("misc", "units") == 0 { (b.speed_kmh, "km/h") } else { (b.speed_kmh / 1.609_344, "mph") };
+    text.0 = fps_line + &format!(
+        "{:5.1} {unit}   gear {gear}   {:5.0} rpm{}{}{}{}\nlean {:5.1} deg   fork {:3.0} mm   shock {:3.0} mm   rear slip {:+.2}   {surface}{}{timing_str}",
+        speed,
         b.powertrain.rpm(),
         if b.powertrain.stalled { "   STALLED (Enter)" } else { "" },
         if b.powertrain.limiter_cut { "   LIMITER" } else { "" },
+        stand_str,
         dirt_str,
         b.lean_angle_deg,
         b.fork_compression * 1000.0,

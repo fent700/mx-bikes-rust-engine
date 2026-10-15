@@ -8,6 +8,16 @@
 use mxbikes_formats::bike_def::SteerDefinition;
 
 const DEG: f32 = std::f32::consts::PI / 180.0;
+
+fn sign(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
 const LEAN_RATE_SAMPLES: usize = 5;
 const YAW_RATE_SAMPLES: usize = 40;
 pub const MAX_TORQUE: f32 = 250.0;
@@ -57,8 +67,16 @@ pub struct SteerInputs {
     pub lean: f32,
     /// Heading, positive turning right (deg).
     pub heading: f32,
-    /// Friction coefficient available at the tyres.
+    /// Lateral friction coefficient of the front tyre (the game reads the tyre's last mu_y).
     pub grip: f32,
+    /// Profile aid `leanhelp` bits: 1 = rate-limited, load-blended lean target; 2 = target
+    /// clamped to the grip-limited lean (else scaled by speed / 6 below 6 m/s).
+    pub lean_help: u32,
+    /// Profile aid `leanhelp_scale`: return-to-upright rate as a fraction of 180 deg/s.
+    pub lean_help_scale: f32,
+    /// Front tyre on a loose surface (game surface types 4, 5, 7, 9-12, 14): grip x 1.4 for
+    /// the lean help limit.
+    pub loose_surface: bool,
     /// Lateral ground slope under the bike (rad).
     pub bank: f32,
     /// Front wheel normal load and the bike + rider weight (N).
@@ -74,8 +92,7 @@ impl SteerController {
     /// Lean angle a rider may ask for, as the game computes it: the radius of the steady turn the
     /// tyre grip (with ground bank) supports at this speed; a radius under 1 m allows 90 degrees.
     /// The result is scaled by speed / 6 below 6 m/s. There is no other clamp in the original.
-    fn max_lean(i: &SteerInputs, right: bool) -> f32 {
-        let mu = i.grip * 0.8666;
+    fn max_lean(i: &SteerInputs, mu: f32, right: bool) -> f32 {
         let theta = if right { i.bank } else { -i.bank };
         let (s, c) = theta.sin_cos();
         let v2 = i.speed * i.speed;
@@ -115,16 +132,63 @@ impl SteerController {
         self.yaw_index = (self.yaw_index + 1) % YAW_RATE_SAMPLES;
         let yaw_rate = self.yaw_rates.iter().sum::<f32>() / YAW_RATE_SAMPLES as f32;
 
-        // Target lean from the stick, rate limited (slower at high speed).
-        let limit = Self::max_lean(i, i.stick >= 0.0);
-        let wanted = i.stick.clamp(-1.0, 1.0) * limit;
-        let speed_factor = if i.speed >= 20.0 {
-            1.0 - ((i.speed - 20.0) * 0.015).atan() / std::f32::consts::FRAC_PI_2
+        // Lean target for the player's bike (FUN_14019d360, the branch taken when bike + 0x268 is
+        // set): a piecewise stick curve, 24 deg at 0.4, 45 deg at 0.7, 80 deg at full stick.
+        let a = i.stick.abs().min(1.0);
+        let curve = if a < 0.4 {
+            a / 0.4 * 24.0
+        } else if a < 0.7 {
+            (a - 0.4) / 0.3 * 21.0 + 24.0
         } else {
-            1.0
+            (a - 0.7) / 0.3 * 35.0 + 45.0
         };
-        let max_step = 180.0 * speed_factor * dt;
-        self.target_lean += (wanted - self.target_lean).clamp(-max_step, max_step);
+        let mut target = curve * sign(i.stick);
+        if i.lean_help & 2 == 0 {
+            if i.speed < 6.0 {
+                target *= i.speed / 6.0;
+            }
+        } else {
+            let mu = if i.loose_surface { i.grip * 1.4 } else { i.grip };
+            if i.stick >= 0.0 {
+                target = target.min(Self::max_lean(i, mu, true));
+            } else {
+                target = target.max(-Self::max_lean(i, mu, false));
+            }
+        }
+        if i.lean_help & 1 == 0 {
+            self.target_lean = target;
+        } else {
+            // Blend towards the current lean as the front unloads, then rate limit: leaning in at
+            // up to 180 deg/s (scaled by the stick), returning at leanhelp_scale * 180 deg/s.
+            let half_weight = i.weight * 0.5;
+            let f = if i.lean_help & 2 == 0 {
+                (i.front_load.max(0.0) / half_weight).sqrt() * 0.8 + 0.2
+            } else if i.front_load >= half_weight {
+                1.0
+            } else {
+                let side = if i.stick < 0.0 { -Self::max_lean(i, i.grip, false) } else { Self::max_lean(i, i.grip, true) };
+                let r = (self.target_lean / side).clamp(-1.0, 1.0);
+                let f0 = (1.0 - r.abs().sqrt()) * 0.2;
+                if i.front_load > 0.0 { (i.front_load / half_weight).sqrt() * (1.0 - f0) + f0 } else { f0 }
+            };
+            let desired = (1.0 - f) * i.lean + f * target;
+            let speed_factor = if i.speed >= 20.0 {
+                1.0 - ((i.speed - 20.0) * 0.015).atan() / std::f32::consts::FRAC_PI_2
+            } else {
+                1.0
+            };
+            let base = i.lean_help_scale * speed_factor * 180.0;
+            let prev = self.target_lean;
+            let (out, mult) = if desired >= 0.0 {
+                if desired > prev { (true, i.stick) } else { (false, 0.0) }
+            } else if prev <= desired {
+                (true, 0.0)
+            } else {
+                (false, i.stick.abs())
+            };
+            let step = dt * ((speed_factor * 180.0 - base) * mult + base);
+            self.target_lean = if out { (prev + step).min(desired) } else { (prev - step).max(desired) };
+        }
 
         let error = i.lean - self.target_lean;
         self.integral += error * dt;
