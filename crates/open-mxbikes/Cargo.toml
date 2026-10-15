@@ -1,0 +1,35 @@
+[package]
+name = "open-mxbikes"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+mxbikes-vfs = { path = "../mxbikes-vfs" }
+mxbikes-formats = { path = "../mxbikes-formats" }
+mxbikes-physics = { path = "../mxbikes-physics" }
+glam.workspace = true
+tracing.workspace = true
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_asset",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_gilrs",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_state",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_window",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "png",
+    "bevy_audio",
+    "wav",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd",
+    "x11",
+] }

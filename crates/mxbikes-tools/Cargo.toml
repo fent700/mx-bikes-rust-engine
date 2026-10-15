@@ -1,0 +1,18 @@
+[package]
+name = "mxbikes-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mxb-dump"
+path = "src/main.rs"
+
+[dependencies]
+mxbikes-vfs = { path = "../mxbikes-vfs" }
+mxbikes-formats = { path = "../mxbikes-formats" }
+mxbikes-physics = { path = "../mxbikes-physics" }
+glam.workspace = true
+serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

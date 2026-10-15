@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mxbikes-vfs",
+    "crates/mxbikes-formats",
+    "crates/mxbikes-physics",
+    "crates/open-mxbikes",
+    "crates/mxbikes-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Open-MXBikes Contributors"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/open-mxbikes/open-mxbikes"
+
+[workspace.dependencies]
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+glam = { version = "0.29", features = ["serde"] }
+bytemuck = { version = "1.21", features = ["derive"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+walkdir = "2.5"
+flate2 = "1.0"

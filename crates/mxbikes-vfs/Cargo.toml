@@ -1,0 +1,12 @@
+[package]
+name = "mxbikes-vfs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+zip.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true

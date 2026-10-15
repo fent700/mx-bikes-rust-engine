@@ -1,0 +1,13 @@
+[package]
+name = "mxbikes-physics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+mxbikes-formats = { path = "../mxbikes-formats" }
+glam.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
