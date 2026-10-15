@@ -15,6 +15,44 @@ profile `gfx` x / y default to 0 (desktop size), not 800 x 600. Autoshift was ch
 full throttle (`examples/autoshift_run.rs`); it does not shift at part throttle below the table rpm,
 as in the game.
 
+### Tyre, wheel slip, aids, airborne steering (2026-10-14, later)
+
+- `tyre_model.rs` is now a term-for-term port of the bike tyre evaluator `FUN_1401e2a90` with
+  `FUN_1401e2500` (pure lateral), `FUN_1401e2890` (combined lateral) and `FUN_1401e21d0` (slip
+  stiffness). The packed array is at tyre + 0xc0. Per step the wheel code (`FUN_1401a2fb0` ->
+  `FUN_1401b92d0`) writes slot 0x11 / 0x2b = surface grip, 0x12 / 0x2c = `long_stiffness` /
+  `lat_stiffness` (1 when absent), 0x63 = rolling resistance (`resistance_dry`/`_wet`).
+  Fixed against the previous version: the camber residual moment is `Fz R0 q_Dz8 gamma cos(alpha)
+  * grip` (the old code had an invented `* 0.1` and a `Gxa` factor); the trail uses the combined
+  equivalent slip `sqrt(alpha^2 + (Kx / (Ky + 0.1))^2 kappa^2)` and `cos(alpha)`; `Gyk`/`Gxa` are
+  not clamped at zero; B denominators are `C D + 0.1`; rolling resistance is the moment
+  `My = -R0 Fz res (q_sy1 atan(v_roll / 16.667) + q_sy2 Fx / Fz0)` applied to the wheel spin
+  (dBodyAddRelTorque), replacing the invented `Fz * res * 0.01` force. Antigravity's q_sy1 slip
+  shift was correct.
+- Wheel slip states follow `FUN_1401a2fb0`: relaxation length 0.15 m for both, state clamps
+  +-0.5 / +-1, low-speed terms `(cos(pi |vx| / 2.5) + 1) * 500 / K_eff * v_slip` below 2.5 m/s
+  (replacing the invented creep damping), effective rolling radius `R1 - (R1 - loaded) / 3`,
+  tyre force applied at the ground contact and the road torque using the loaded radius.
+- Brakes (`FUN_1401a5780`): dead zone = leverage ratio * DeadZone. Max pressure formula checked
+  (`FUN_140196500`). The disc temperature gaussian uses OptTemp * TempFactor as sigma, which is
+  ~1 for stock discs, so it is not modelled.
+- `brakehelp` and `tractionhelp` are now the game's (`FUN_1401ada40`, ops 0x266 / 0x267 set
+  bike + 0x23960 / 0x23988). Brake help, above 8 m/s: front released when its slip passes
+  `-cos^2(lean) * kappa_peak`, front limited by the front load share (`2 Ff/(Ff+Fr) - 1` against
+  `0.7 + 0.3 cos^200(lean)`, 0.4 ramp), rear released on lock; both through a limiter rising 6/s
+  and falling 1.2/s. Traction help: throttle limit from 1 down to 0.75 as rear slip goes from 0.7
+  to 2.1 * `cos^3(lean) * kappa_peak`. `kappa_peak = 3 Dx / Kx_eff` at Fz0. The previous versions
+  of both aids were invented.
+- Steering (`FUN_14019d360`): the lean PID is blended into a bar-centring PD as the front unloads
+  (the old code faded the PID to zero, so the bars flopped to full lock in the air); with the front
+  wheel off the ground the PD targets the direction of travel when both wheels are off. INFERRED:
+  target 0 in a wheelie (decompiled target unresolvable). Total clamped to +-250 N m.
+- With brake help on (profile default) a full-brake stop from 120 km/h is stable (72.5 m); with it
+  off, the bike now goes over the bars, because the rider body does not move back (not ported).
+- Still crashes: `mxb-dump ride club` (no rider input) rolls over in the air on the first jump, as
+  it did before these changes.
+- New tools: `examples/brake_run.rs <bike> <front> <rear> [help]`, `examples/cat_file.rs <vfs path>`.
+
 ## The setup
 
 - Repo: `N:\etc\rewrite project` (not a git repo). Windows; Git Bash and PowerShell both work.
@@ -99,11 +137,10 @@ Every item cites its decompiled function (`FUN_xxxxxxxx`), PE offset, or asset p
   - Dynamic pitch target (`0x22e30`): terrain relative pitch, stand blend, nose-down stoppie vs wheelie limits (`FUN_1401a8480` line 1009), jump pitch limits, slewed by `PitchSpeed` (5.0/s) into `fore_aft` (`0x22e38`).
   - Dynamic torso lean with high-speed attenuation, slewed by `LeanSpeed` (2.0/s).
   - Rider pose angles (`pitch_deg`, `roll_deg`, `steer_rot_deg`) matching lines 1165–1209.
-  - Crash detachment: 25-frame rolling reaction force buffer enforcing exact limits: `|Fx| > 4000 N`, `|Fz| > 10000 N`, `Fy > 15000 N`, `avg_Fy_ext < -2000 N` (`FUN_1401a8480` lines 1489–1499).
+  - Crash detachment: NOT the force-buffer rule (removed 2026-10-14; it belongs to the unported rider-body springs). Only the head-sphere check remains.
 - **Riding aids:** Full simulation and propagation from `profile.ini`:
   - `stabilityhelp`: roll, pitch, and yaw restoring torques (`FUN_1401a8480` lines 2095–2275).
-  - `brakehelp`: anti-lock and anti-loop modulation (op 0x266 / `FUN_14006d050`).
-  - `tractionhelp`: rear slip-ratio throttle attenuation (op 0x267 / `FUN_14006d050`).
+  - `brakehelp` / `tractionhelp`: re-ported from `FUN_1401ada40` on 2026-10-14 (see above; the earlier versions were invented).
   - `autoriderlrlean`, `autoriderdab`, `autoridersit`.
   - Propagated on bike spawn, setup apply, and settings Done.
 - **Setup file binary format (`.stp`):** Magic `0x459353c8`, versions `0x116` / `0x115`, 32-byte bike ID, parameter words, notes (`FUN_140199330`, `FUN_140198e10`, ops 0x23b/0x23c).
