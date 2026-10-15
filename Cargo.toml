@@ -9,11 +9,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Open-MXBikes Contributors"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/open-mxbikes/open-mxbikes"
+repository = "https://github.com/fent700/mx-bikes-rust-engine"
 
 [workspace.dependencies]
 thiserror = "2.0"

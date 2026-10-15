@@ -2668,7 +2668,7 @@ dependencies = [
 
 [[package]]
 name = "mxbikes-formats"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "flate2",
@@ -2681,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "mxbikes-physics"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "glam",
  "mxbikes-formats",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "mxbikes-tools"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "glam",
  "image",
@@ -2704,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "mxbikes-vfs"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
@@ -3169,7 +3169,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open-mxbikes"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bevy",
  "glam",
