@@ -118,6 +118,11 @@ pub fn decode_parallel(file: &[u8], records: &[&ImageRecord]) -> Vec<Option<Deco
             .into_iter()
             .zip(records)
             .map(|(h, r)| match h.join() {
+                // An empty image cannot become a GPU texture (wgpu rejects zero extents).
+                Ok(Ok(img)) if img.width == 0 || img.height == 0 => {
+                    warn!("texture '{}' decoded empty ({}x{} in the record)", r.name, r.width, r.height);
+                    None
+                }
                 Ok(Ok(img)) => Some(img),
                 Ok(Err(e)) => {
                     warn!("texture '{}' not decoded: {e}", r.name);
