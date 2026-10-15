@@ -4,6 +4,17 @@ You are picking up **Open-MXBikes**: a clean-room Rust / Bevy 0.15 reimplementat
 MX Bikes that runs on the game's own assets. Goal: physics, graphics, functions and UI 1:1 with
 the original. Read this section fully, then the rest of this file as reference.
 
+## Version control (2026-10-14)
+
+The repo is now a local git repository. Commit after each working change and read `git diff`
+before trusting another agent's report. Fixed on 2026-10-14 after review: an invented crash rule
+(chassis force limits taken from the rider-body spring check of `FUN_1401a8480`) that crashed the
+bike on every landing; the helmet camera (now at the helmet `cam` object, helmet hidden, pitched
+down 15 + 20 * view/pitch degrees, `FUN_14000b7e0`); the program now starts at the main menu;
+profile `gfx` x / y default to 0 (desktop size), not 800 x 600. Autoshift was checked and works at
+full throttle (`examples/autoshift_run.rs`); it does not shift at part throttle below the table rpm,
+as in the game.
+
 ## The setup
 
 - Repo: `N:\etc\rewrite project` (not a git repo). Windows; Git Bash and PowerShell both work.
