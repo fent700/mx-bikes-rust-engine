@@ -591,7 +591,9 @@ mod tests {
     #[test]
     fn graphics_spin_resolution_and_refresh() {
         let mut p = Profile::default();
-        assert_eq!((p.i("gfx", "x"), p.i("gfx", "y")), (800, 600));
+        // Default 0 x 0 = desktop size; start the stepping from 800 x 600.
+        p.set("gfx", "x", 800);
+        p.set("gfx", "y", 600);
         assert!(p.spin("id_resolution", 1));
         assert_eq!((p.i("gfx", "x"), p.i("gfx", "y")), (1024, 768));
         assert!(p.spin("id_resolution", 1));
