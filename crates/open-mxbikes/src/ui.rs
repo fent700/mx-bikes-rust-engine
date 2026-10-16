@@ -44,6 +44,27 @@ pub enum UiMode {
     TestSetup,
     /// `testsetup.mnu` / `idd_bikechoose`.
     BikeChoose,
+    /// `connection.mnu` / `connection_dialog`: loading screen before entering session.
+    Loading,
+}
+
+#[derive(Resource, Debug, Clone)]
+pub struct LoadingState {
+    pub timer: f32,
+    pub target_mode: UiMode,
+    pub stage: usize,
+    pub reload: Option<crate::world::ReloadSession>,
+}
+
+impl Default for LoadingState {
+    fn default() -> Self {
+        Self {
+            timer: 0.0,
+            target_mode: UiMode::Pit,
+            stage: 0,
+            reload: None,
+        }
+    }
 }
 
 #[derive(Resource, Debug, Clone)]
@@ -188,6 +209,7 @@ struct Values<'a> {
     session: Option<&'a crate::session::SessionChoice>,
     vfs: &'a mxbikes_vfs::MxBikesVfs,
     bindings: Option<&'a crate::input::Bindings>,
+    loading: Option<&'a LoadingState>,
 }
 
 /// Lap and sector times as the game prints them (`FUN_140001090`): s.mmm or m'ss.mmm.
@@ -207,6 +229,33 @@ impl Values<'_> {
     fn get(&self, name: &str) -> ItemValue {
         let id = name.to_ascii_lowercase();
         let mut v = ItemValue::default();
+        if self.mode == UiMode::Loading {
+            match id.as_str() {
+                "id_message" => {
+                    let msg = self.strings.get("syncing").unwrap_or("Syncing...");
+                    let text = if msg.ends_with("...") { msg.to_string() } else { format!("{msg}...") };
+                    v.text = Some(text);
+                    return v;
+                }
+                "id_info" => {
+                    let stages = [
+                        self.strings.get("CC_SyncTrackGraphics").unwrap_or("Track Graphics"),
+                        self.strings.get("CC_SyncBikeGraphics").unwrap_or("Bike Graphics"),
+                        self.strings.get("CC_SyncTerrainDeformationData").unwrap_or("Terrain Deformation Data"),
+                        self.strings.get("CC_SyncData").unwrap_or("Waiting"),
+                    ];
+                    let stage = self.loading.map(|l| l.stage).unwrap_or(0).min(stages.len() - 1);
+                    v.text = Some(stages[stage].to_string());
+                    return v;
+                }
+                "id_tip" => {
+                    let tip = self.strings.get("tip_1").unwrap_or("Keep the \"Reset\" control pressed for 3 seconds to reset the bike to track");
+                    v.text = Some(tip.to_string());
+                    return v;
+                }
+                _ => {}
+            }
+        }
         if self.mode == UiMode::Garage {
             if let Some(s) = self.setup {
                 v.text = s.text(&id);
@@ -399,6 +448,7 @@ pub fn setup_ui(mut commands: Commands, options: Res<LaunchOptions>, vfs: Res<Vf
         Some("replays") => UiMode::Replays,
         Some("testsetup") => UiMode::TestSetup,
         Some("bikechoose") => UiMode::BikeChoose,
+        Some("loading") => UiMode::Loading,
         _ if options.track == "bg" || options.track == "menu" || options.camera == "showroom" => UiMode::MainMenu,
         _ => UiMode::None,
     };
@@ -548,7 +598,7 @@ pub fn handle_menu_inputs(
             UiMode::Garage => UiMode::Pit,
             UiMode::Settings => ui_state.settings_return.take().unwrap_or(if in_menu_scene { UiMode::MainMenu } else { UiMode::Pit }),
             UiMode::Profiles | UiMode::Replays | UiMode::TestSetup => UiMode::MainMenu,
-            UiMode::BikeChoose => UiMode::TestSetup,
+            UiMode::BikeChoose | UiMode::Loading => UiMode::TestSetup,
             UiMode::MainMenu => UiMode::MainMenu,
         };
     }
@@ -1176,6 +1226,7 @@ pub fn sync_menu_visibility(
         Option<Res<crate::world::LapTimer>>,
         Option<Res<crate::session::SessionChoice>>,
         Option<Res<crate::input::Bindings>>,
+        Option<Res<LoadingState>>,
     ),
     data: Option<ResMut<UiData>>,
     vfs: Res<Vfs>,
@@ -1185,7 +1236,7 @@ pub fn sync_menu_visibility(
     windows: Query<&Window>,
     mut lap_count: Local<usize>,
 ) {
-    let (setup, profile, track, laps, session, bindings) = sources;
+    let (setup, profile, track, laps, session, bindings, loading) = sources;
     let Some(mut data) = data else { return };
     if let Ok(w) = windows.get_single() {
         data.screen_h = w.resolution.height();
@@ -1194,6 +1245,7 @@ pub fn sync_menu_visibility(
         || session.as_ref().is_some_and(|s| s.is_changed())
         || bindings.as_ref().is_some_and(|b| b.is_changed())
         || profile.as_ref().is_some_and(|p| p.is_changed())
+        || loading.as_ref().is_some_and(|l| l.is_changed())
         || laps.as_ref().is_some_and(|l| std::mem::replace(&mut *lap_count, l.laps.len()) != l.laps.len());
     if !ui_mode.is_changed() && !popup.is_changed() && !ui_state.is_changed() && !setup_changed {
         return;
@@ -1217,13 +1269,14 @@ pub fn sync_menu_visibility(
             ("testsetup.mnu", "idd_testing_set"),
         ],
         UiMode::BikeChoose => vec![("testsetup.mnu", "idd_bikechoose")],
+        UiMode::Loading => vec![("connection.mnu", "connection_dialog")],
     };
     if let Some((file, dialog)) = &popup.0 {
         dialogs.push((file.as_str(), dialog.as_str()));
     }
     let window = windows.get_single().map(|w| (w.resolution.physical_width(), w.resolution.physical_height())).unwrap_or((1600, 900));
     let strings = data.strings.clone();
-    let values = Values { mode: *ui_mode, setup: setup.as_deref(), profile: profile.as_deref(), strings: &strings, window, state: &ui_state, track: track.as_deref(), laps: laps.as_deref(), session: session.as_deref(), vfs: &vfs.0, bindings: bindings.as_deref() };
+    let values = Values { mode: *ui_mode, setup: setup.as_deref(), profile: profile.as_deref(), strings: &strings, window, state: &ui_state, track: track.as_deref(), laps: laps.as_deref(), session: session.as_deref(), vfs: &vfs.0, bindings: bindings.as_deref(), loading: loading.as_deref() };
     for (file, dialog) in dialogs {
         let Some(node) = data.menu(file, dialog).cloned() else {
             warn!("ui dialog {file}/{dialog} not found");
@@ -1267,6 +1320,7 @@ pub fn handle_menu_interactions(
     mut setup: Option<ResMut<BikeSetup>>,
     mut profile: Option<ResMut<Profile>>,
     mut session: Option<ResMut<crate::session::SessionChoice>>,
+    mut loading_state: Option<ResMut<LoadingState>>,
     vfs: Res<Vfs>,
     data: Option<Res<UiData>>,
 ) {
@@ -1429,12 +1483,23 @@ pub fn handle_menu_interactions(
                             p.save();
                         }
                         if let Some(s) = session.as_ref() {
-                            if let Some((track, bike, paints)) = s.session_params() {
-                                reload_events.send(crate::world::ReloadSession { track, bike, paints });
+                            let reload = s.session_params().map(|(track, bike, paints)| {
+                                crate::world::ReloadSession { track, bike, paints }
+                            });
+                            if reload.is_none() {
+                                s.start();
+                            }
+                            if let Some(ls) = loading_state.as_mut() {
+                                ls.timer = 0.0;
+                                ls.stage = 0;
+                                ls.target_mode = UiMode::Pit;
+                                ls.reload = reload;
+                                popup.0 = None;
+                                *ui_mode = UiMode::Loading;
+                            } else if let Some(r) = reload {
+                                reload_events.send(r);
                                 popup.0 = None;
                                 *ui_mode = UiMode::Pit;
-                            } else {
-                                s.start();
                             }
                         }
                     }
@@ -1626,6 +1691,12 @@ pub fn handle_menu_interactions(
                     "id_yes" if popup.0.as_ref().is_some_and(|p| p.1 == "exit_confirm") => {
                         exit.send(AppExit::Success);
                     }
+                    "id_cancel" if *ui_mode == UiMode::Loading => {
+                        if let Some(ref mut ls) = loading_state {
+                            ls.reload = None;
+                        }
+                        *ui_mode = UiMode::TestSetup;
+                    }
                     "id_no" | "id_close" | "id_cancel" => {
                         popup.0 = None;
                         ui_state.capture = None;
@@ -1644,6 +1715,29 @@ pub fn handle_menu_interactions(
                 p.save();
             }
         }
+    }
+}
+
+pub fn update_loading_screen(
+    time: Res<Time>,
+    mut ui_mode: ResMut<UiMode>,
+    loading: Option<ResMut<LoadingState>>,
+    mut reload_events: EventWriter<crate::world::ReloadSession>,
+) {
+    if *ui_mode != UiMode::Loading {
+        return;
+    }
+    let Some(mut loading) = loading else { return };
+    loading.timer += time.delta_secs();
+    let new_stage = ((loading.timer / 0.4) as usize).min(3);
+    if new_stage != loading.stage {
+        loading.stage = new_stage;
+    }
+    if loading.timer >= 1.6 {
+        if let Some(reload) = loading.reload.take() {
+            reload_events.send(reload);
+        }
+        *ui_mode = loading.target_mode;
     }
 }
 

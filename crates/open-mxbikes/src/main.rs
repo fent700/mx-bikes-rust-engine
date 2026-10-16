@@ -119,6 +119,7 @@ fn main() {
         .insert_resource(Vfs(Arc::new(vfs)))
         .insert_resource(ClearColor(Color::srgb(0.55, 0.65, 0.8)))
         .init_resource::<input::ControlState>()
+        .init_resource::<ui::LoadingState>()
         .add_event::<world::ReloadSession>()
         .add_event::<ui::ApplyGraphicsSettings>()
         .add_systems(
@@ -148,6 +149,7 @@ fn main() {
                 camera::update_camera,
                 world::update_lod_switching,
                 world::follow_sky,
+                ui::update_loading_screen,
                 ui::sync_menu_visibility,
                 ui::handle_menu_interactions,
                 ui::update_cursor,
