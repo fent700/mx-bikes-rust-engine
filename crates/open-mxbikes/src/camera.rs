@@ -94,14 +94,17 @@ pub fn update_camera(
         }
     }
     if controls.toggle_camera {
+        // The game cycles through 3 views during riding (FUN_140010600): Static Onboard View
+        // (mode 0), Dynamic Onboard View (mode 1), and External View (mode 2). Our Onboard is
+        // mode 0; mode 1 (Dynamic) is not ported yet. Side, Left, and Showroom are menu-only.
         cam.mode = match cam.mode {
             CameraMode::Chase => CameraMode::Onboard,
-            CameraMode::Onboard => CameraMode::Side,
-            CameraMode::Side => CameraMode::Left,
-            CameraMode::Left => CameraMode::Showroom(ShowroomCameraConfig::default()),
-            CameraMode::Showroom(_) => CameraMode::Chase,
+            CameraMode::Onboard => CameraMode::Chase,
+            // If we're in a menu/debug view, toggle returns to the chase cam.
+            CameraMode::Side | CameraMode::Left | CameraMode::Showroom(_) => CameraMode::Chase,
         };
     }
+
     let bike = &sim.0;
     let (origin, rot) = bike.chassis_transform();
     let dt = time.delta_secs();
