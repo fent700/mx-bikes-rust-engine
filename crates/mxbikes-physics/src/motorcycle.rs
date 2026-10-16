@@ -468,6 +468,23 @@ impl Motorcycle {
     // ----- Public transforms for rendering -----
 
     /// World transform of the chassis local origin.
+    /// Moves the bike so its chassis origin is at `origin` (orientation unchanged).
+    pub fn set_chassis_origin(&mut self, origin: Vec3) {
+        self.com = origin + self.rotation * self.com_local;
+    }
+
+    /// Fork and shock fully extended, as on a stand.
+    pub fn extend_suspension(&mut self) {
+        self.fork_compression = 0.0;
+        let (lo, hi) = self.linkage.angle_range;
+        self.swingarm_angle = lo;
+        let at_lo = self.shock_compression();
+        self.swingarm_angle = hi;
+        if self.shock_compression() > at_lo {
+            self.swingarm_angle = lo;
+        }
+    }
+
     pub fn chassis_transform(&self) -> (Vec3, Quat) {
         (self.to_world(Vec3::ZERO), self.rotation)
     }

@@ -21,7 +21,11 @@ static DETAIL_BIAS_MILLI: AtomicU32 = AtomicU32::new(0);
 
 /// Window mode for `gfx/fullscreen` (1 fullscreen, 2 borderless, 0 windowed).
 pub fn window_mode(profile: &Profile) -> WindowMode {
+    // Resolution 0 x 0 is the desktop size (`mxbikes.ini` [gfx_default]): fill the screen at
+    // the desktop mode rather than switching the display to a stand-in size.
+    let desktop = profile.i("gfx", "x") <= 0 || profile.i("gfx", "y") <= 0;
     match profile.i("gfx", "fullscreen") {
+        1 if desktop => WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
         1 => WindowMode::Fullscreen(MonitorSelection::Primary),
         2 => WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
         _ => WindowMode::Windowed,

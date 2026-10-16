@@ -474,6 +474,22 @@ pub fn spawn_world_internal(
         }
 
         let set = scene::build_materials(data, &map.materials, images, std_materials, &HashMap::new());
+        // INFERRED: in the old "MAP" format (the menu background) a material without flag 0x200
+        // is drawn without lighting; that is the backdrop gradient (0x500), while the lit ground
+        // has 0x700. No other stock map uses these bits.
+        if map.version == 0 {
+            for (i, m) in map.materials.iter().enumerate() {
+                let Some(mat) = std_materials.get_mut(&set.get(i as u32 + 1)) else { continue };
+                if m.diffuse.flags & 0x200 == 0 {
+                    mat.unlit = true;
+                    mat.alpha_mode = AlphaMode::Opaque;
+                    mat.cull_mode = None;
+                } else if m.diffuse.flags & 0x400 != 0 {
+                    // The ground patch fades out through its texture alpha.
+                    mat.alpha_mode = AlphaMode::Blend;
+                }
+            }
+        }
         let s = &map.scenery;
         for (slot, mesh) in scene::scenery_meshes(&s.vertices, &s.indices, &s.submeshes) {
             let tex = s.materials.get(slot as usize).map(|m| m.texture).unwrap_or(0);
@@ -552,15 +568,20 @@ pub fn spawn_world_internal(
         fog_color: Color::linear_rgb(fog_rgb[0], fog_rgb[1], fog_rgb[2]),
         fog_density: fog.and_then(|f| f.get_f32("density")).unwrap_or(0.0008),
     });
+    // The game lights with the fixed-function model, texture * (ambient + light * N.L) clamped,
+    // using the `.amb` colours directly. With the camera at exposure 1 and no tonemapping
+    // (main.rs), a directional illuminance of pi (Bevy's Lambert term divides by pi) gives the
+    // light multiplier; an ambient brightness of pi matched the game's menu picture (orange
+    // fender texture 233 / 168 drawn at 207 / 170 in the game, 228 / 163 here).
     commands.insert_resource(AmbientLight {
         color: Color::linear_rgb(ambient[0], ambient[1], ambient[2]),
-        brightness: 500.0,
+        brightness: std::f32::consts::PI,
     });
     let shadows_enabled = profile.map_or(true, |p| p.i("gfx", "shadow_disable") == 0);
     commands.spawn((
         DirectionalLight {
-            color: Color::linear_rgb(sun[0] / 1.1, sun[1] / 1.1, sun[2] / 1.1),
-            illuminance: 11_000.0,
+            color: Color::linear_rgb(sun[0], sun[1], sun[2]),
+            illuminance: std::f32::consts::PI,
             shadows_enabled,
             ..default()
         },
@@ -699,6 +720,7 @@ fn spawn_bike(
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
 ) {
     let (id, autoshift) = (options.bike.as_str(), options.autoshift);
+    // Without a chosen paint the model's own textures show, as in the game's menu.
     let mut bike_paint = match options.paints.get("bike") {
         Some(name) => load_paint(vfs, &format!("bikes/{id}/paints/{name}.pnt")),
         None => HashMap::new(),
@@ -824,13 +846,53 @@ fn spawn_bike(
         let p = gfx.get_child("steer")?.get_child(g)?.get_child("pos")?;
         Some(lh_to_rh(Vec3::new(p.get_f32("x")?, p.get_f32("y")?, p.get_f32("z")?)))
     });
-    match rider::spawn_rider(commands, vfs, chassis, options, track_dirt_color, grips, meshes, images, std_materials, bindposes) {
-        Some(rig) => commands.insert_resource(rig),
-        None => warn!("rider model not loaded"),
-    }
+    let menu = options.track == "bg" || options.track == "menu";
+    let mut rig = rider::spawn_rider(commands, vfs, chassis, options, track_dirt_color, grips, menu, meshes, images, std_materials, bindposes);
 
     let mut bike = Motorcycle::new(def, tyres, spawn.position, spawn.heading);
     bike.place_on(spawn.position, spawn.heading);
+    if menu {
+        // Main menu (`FUN_1400e8790`, `FUN_1400455c0`): the bike stands on `misc/stand` with its
+        // `.geom` `stand_linkfront` / `stand_linkrear` points on the stand top (`stand.ini`
+        // [data] height), suspension extended; the rider stands beside it.
+        let geom_name = read_cfg(vfs, &format!("bikes/{id}/{id}.cfg"))
+            .and_then(|c| c.get_str("geom").map(str::to_owned))
+            .unwrap_or(format!("{id}.geom"));
+        let geom = read_cfg(vfs, &format!("bikes/{id}/{geom_name}"));
+        let link = |k: &str| geom.as_ref().and_then(|g| g.get_vec3(k)).map(lh_to_rh);
+        let stand_height = read_cfg(vfs, "misc/stand/stand.ini")
+            .and_then(|c| c.get_child("data").and_then(|d| d.get_f32("height")))
+            .unwrap_or(0.405);
+        let mid = match (link("stand_linkfront"), link("stand_linkrear")) {
+            (Some(f), Some(r)) => (f + r) * 0.5,
+            _ => Vec3::new(0.0, 0.33, 0.0),
+        };
+        // INFERRED: the scene turns the bike to face the other way from the spawn heading (the
+        // angle passed to the scene rotation in `FUN_1400e7cd0` is lost in the decompile; 180
+        // degrees matches the game's menu picture).
+        let heading = spawn.heading + std::f32::consts::PI;
+        bike.place_on(spawn.position, heading);
+        let rot = Quat::from_rotation_y(heading);
+        bike.extend_suspension();
+        let stand_pos = Vec3::new(spawn.position.x, spawn.position.y, spawn.position.z);
+        let origin = stand_pos + Vec3::Y * (stand_height - mid.y) - rot * Vec3::new(mid.x, 0.0, mid.z);
+        bike.set_chassis_origin(origin);
+        if let Some((data, model)) = load_edf(vfs, "misc/stand/stand.edf") {
+            let set = scene::build_materials(&data, &model.materials, images, std_materials, &bike_paint);
+            let e = scene::spawn_group(commands, &model, "", &set, meshes, "stand");
+            commands.entity(e).insert((Transform::from_translation(stand_pos).with_rotation(rot), WorldEntity));
+        }
+        // The rider root sits at (`ui_pos/lat` - 0.7, `ui_pos/vert`, 0) from the stand
+        // (`FUN_1400e7cd0`), on the ground; the idle clip itself moves the body beside the bike.
+        if let Some(r) = rig.as_mut() {
+            let (lat, vert) = r.menu_ui_pos().unwrap_or((0.62, 0.0));
+            r.set_menu_root(Vec3::new(lat - 0.7 + mid.x, vert - (stand_height - mid.y), mid.z));
+        }
+    }
+    match rig {
+        Some(rig) => commands.insert_resource(rig),
+        None => warn!("rider model not loaded"),
+    }
     // `--dirt` sets the starting dirt amount (0.1666 / 0.5 / 0.8333 are the mud stage cuts).
     bike.dirt_factor = dirt_factor;
     bike.rider_dirt_factor = dirt_factor;

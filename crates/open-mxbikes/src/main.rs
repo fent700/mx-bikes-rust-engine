@@ -191,6 +191,10 @@ fn spawn_camera(
     commands.spawn((
         Camera3d::default(),
         msaa,
+        // Exposure 1 (ev100 = log2(1 / 1.2)) and no tonemapping: colours come out as the game's
+        // fixed-function lighting computes them (see the light setup in world.rs).
+        bevy::render::camera::Exposure { ev100: -0.263_034_4 },
+        bevy::core_pipeline::tonemapping::Tonemapping::None,
         Projection::Perspective(PerspectiveProjection {
             fov: fov_deg.to_radians(),
             near: 0.05,

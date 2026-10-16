@@ -152,6 +152,35 @@ pub struct RiderRig {
     hands: Vec<HandIk>,
     /// `maxlean` of the animation set (degrees): the bike lean at the ends of the lean clips.
     max_lean: f32,
+    root: Entity,
+    /// Main menu: the rider stands beside the bike playing `rider_stand.anm`.
+    menu: Option<MenuPose>,
+}
+
+/// The main menu rider (`FUN_1400e8790` / `FUN_1400e7cd0`): clip "profile menu idle" from the
+/// animation set's `rider_stand.anm`, looped over `ui_animlength` ms (5000 when absent), at
+/// `ui_pos` lat / vert from the set's `gfx.cfg`.
+struct MenuPose {
+    clip: PoseClip,
+    length_s: f32,
+    lat: f32,
+    vert: f32,
+    /// Rider root in the chassis frame.
+    root: Vec3,
+}
+
+impl RiderRig {
+    /// Lateral and vertical `ui_pos` of the menu pose, if the rig is a menu rider.
+    pub fn menu_ui_pos(&self) -> Option<(f32, f32)> {
+        self.menu.as_ref().map(|m| (m.lat, m.vert))
+    }
+
+    /// Places the menu rider's root in the chassis frame.
+    pub fn set_menu_root(&mut self, root: Vec3) {
+        if let Some(m) = self.menu.as_mut() {
+            m.root = root;
+        }
+    }
 }
 
 /// Lean clip phase (0..1) for a bike lean angle in degrees, as the game computes it: angles past
@@ -312,6 +341,7 @@ pub fn spawn_rider(
     options: &crate::world::LaunchOptions,
     dirt_color: Vec3,
     grips: [Option<Vec3>; 2],
+    menu: bool,
     meshes: &mut Assets<Mesh>,
     images: &mut Assets<Image>,
     std_materials: &mut Assets<StandardMaterial>,
@@ -459,7 +489,35 @@ pub fn spawn_rider(
             })
         })
         .collect();
+    let menu = if menu {
+        let file = format!("rider/animations/{set}/rider_stand.anm");
+        let clip = vfs
+            .read(&file)
+            .ok()
+            .and_then(|d| AnimationFile::parse(&d).ok())
+            .and_then(|a| a.clips.into_iter().find(|c| c.name.eq_ignore_ascii_case("profile menu idle")));
+        match clip {
+            Some(c) => {
+                let ui = anim_cfg.and_then(|c| c.get_child("ui_pos"));
+                Some(MenuPose {
+                    clip: PoseClip::bind(&c, object),
+                    length_s: anim_cfg.and_then(|c| c.get_f32("ui_animlength")).unwrap_or(5000.0) / 1000.0,
+                    lat: ui.and_then(|u| u.get_f32("lat")).unwrap_or(0.0),
+                    vert: ui.and_then(|u| u.get_f32("vert")).unwrap_or(0.0),
+                    root: Vec3::ZERO,
+                })
+            }
+            None => {
+                warn!("{file}: clip 'profile menu idle' not found");
+                None
+            }
+        }
+    } else {
+        None
+    };
     Some(RiderRig {
+        root,
+        menu,
         joints,
         parents: object.nodes.iter().map(|n| n.parent).collect(),
         rest: object
@@ -493,8 +551,23 @@ pub fn spawn_rider(
 /// standing ground s(1-j), standing s j; the head sets the same without the groundsit split.
 /// Within a set, fore/aft blends the centre clip with the back or forward one. All lean sets play
 /// at the bike lean phase.
-pub fn animate_rider(sim: Res<BikeSim>, rig: Option<Res<RiderRig>>, mut q: Query<&mut Transform>) {
+pub fn animate_rider(sim: Res<BikeSim>, rig: Option<Res<RiderRig>>, time: Res<Time>, mut q: Query<&mut Transform>) {
     let Some(rig) = rig else { return };
+    if let Some(m) = &rig.menu {
+        let phase = (time.elapsed_secs() % m.length_s.max(0.1)) / m.length_s.max(0.1);
+        let mut playing = vec![Playing { clip: &m.clip, phase, weight: 1.0, layer: 0 }];
+        let locals = evaluate(&mut playing, rig.joints.len()).into_iter().zip(&rig.rest).map(|(p, r)| p.unwrap_or(*r));
+        for (&e, (r, t)) in rig.joints.iter().zip(locals) {
+            if let Ok(mut tf) = q.get_mut(e) {
+                tf.rotation = r;
+                tf.translation = t;
+            }
+        }
+        if let Ok(mut tf) = q.get_mut(rig.root) {
+            tf.translation = m.root;
+        }
+        return;
+    }
     let r = &sim.0.rider;
     let (s, j, c) = (r.stand, r.airborne, r.stand_cmd);
     let f = r.fore_aft.clamp(-1.0, 1.0);

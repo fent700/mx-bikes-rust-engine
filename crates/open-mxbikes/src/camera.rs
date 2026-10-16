@@ -76,11 +76,17 @@ pub fn update_camera(
     let fov_deg = match cam.mode {
         CameraMode::Onboard => pf("view", "fov", 90.0).clamp(30.0, 150.0),
         CameraMode::Chase => 75.0,
+        // The menu scene's camera is set to 60 degrees (`FUN_1400e7080`, op 0xb0).
+        CameraMode::Showroom(_) => 60.0,
         _ => pf("view", "fov", 90.0).clamp(30.0, 150.0),
     };
     if let Projection::Perspective(p) = projection.as_mut() {
-        if (p.fov - fov_deg.to_radians()).abs() > 1e-4 {
-            p.fov = fov_deg.to_radians();
+        // INFERRED from the menu picture: the game's field of view is vertical at a 4:3 aspect
+        // and the horizontal extent stays fixed at wider aspects; Bevy's FOV is vertical.
+        let aspect = p.aspect_ratio.max(0.1);
+        let vertical = 2.0 * ((fov_deg.to_radians() * 0.5).tan() * (4.0 / 3.0) / aspect).atan();
+        if (p.fov - vertical).abs() > 1e-4 {
+            p.fov = vertical;
         }
         let far = pf("gfx", "drawdistance", 1000.0).max(500.0);
         if (p.far - far).abs() > 0.5 {
@@ -188,22 +194,28 @@ pub fn update_camera(
             t.look_at(focus, Vec3::Y);
         }
         CameraMode::Showroom(cfg) => {
-            // In the bike's heading frame. Angles and offset are given in the game's left-handed
-            // frame, where the bike faces +Z and the camera sits `distance` ahead of it; mirroring
-            // into the right-handed frame negates both angles and the offset's Z.
-            let (_, yaw, _) = rot.to_euler(EulerRot::YXZ);
-            let heading = Quat::from_rotation_y(yaw);
-            let focus = origin + heading * Vec3::new(cfg.shift.x, 0.65 + cfg.shift.y, 0.0);
-            let orbit = Quat::from_euler(EulerRot::YXZ, -cfg.angley_deg.to_radians(), -cfg.anglex_deg.to_radians(), 0.0);
-            t.translation = focus + heading * rot_bike_frame(orbit, cfg.distance);
-            t.look_at(focus, Vec3::Y);
+            // Menu camera (`FUN_14001e710`, mode 0), in the game's left-handed world frame: the
+            // focus is the midpoint of the two wheels raised 0.5 m and moved 0.35 m along x; the
+            // camera turns by `home_cameraanglex` about Y, then `home_cameraangley` about X, and
+            // sits at (shiftx, shifty, -distance) in that frame, looking along its +Z. The angles
+            // are world angles, not relative to the bike.
+            let (front, _) = bike.front_wheel_transform();
+            let (rear, _) = bike.rear_wheel_transform();
+            let lh = |v: Vec3| Vec3::new(v.x, v.y, -v.z);
+            let focus = lh((front + rear) * 0.5) + Vec3::new(0.35, 0.5, 0.0);
+            let (sy, cy) = cfg.anglex_deg.to_radians().sin_cos();
+            let (sx, cx) = cfg.angley_deg.to_radians().sin_cos();
+            let rot = |v: Vec3| {
+                let v = Vec3::new(v.x, cx * v.y - sx * v.z, sx * v.y + cx * v.z);
+                Vec3::new(cy * v.x + sy * v.z, v.y, -sy * v.x + cy * v.z)
+            };
+            let pos = focus + rot(Vec3::new(cfg.shift.x, cfg.shift.y, -cfg.distance));
+            let forward = rot(Vec3::Z);
+            let up = rot(Vec3::Y);
+            t.translation = lh(pos);
+            t.look_to(lh(forward), lh(up));
         }
     }
-}
-
-/// Camera offset `distance` in front of the bike (asset +Z, engine -Z) after the orbit rotation.
-fn rot_bike_frame(rot: Quat, distance: f32) -> Vec3 {
-    rot * Vec3::new(0.0, 0.0, -distance)
 }
 
 /// The helmet view hides the rider's helmet (the camera sits inside it); other views show it.

@@ -339,7 +339,9 @@ fn build(
         };
         let base_color_texture = diffuse.map(|d| images.add(rgba_image(&d, true, true)));
         let metallic_roughness_texture = spec_map.map(|sm| {
-            let mr = metallic_roughness_image(&sm, roughness, m.reflection.is_some());
+            // The game adds its reflection map on top of the lit diffuse colour; treating it as
+            // metal instead hides the paint colour under the ambient white, so it stays dielectric.
+            let mr = metallic_roughness_image(&sm, roughness, false);
             images.add(rgba_image(&mr, false, true))
         });
         if let (Some((source, layer, clean, color)), Some(image)) = (mud_target, base_color_texture.clone()) {
@@ -350,8 +352,19 @@ fn build(
             normal_map_texture: normal.map(|n| images.add(rgba_image(&n, false, true))),
             metallic_roughness_texture,
             perceptual_roughness: roughness,
-            reflectance: if m.reflection.is_some() { 0.5 } else { 0.3 },
-            alpha_mode: if alpha { AlphaMode::Mask(0.5) } else { AlphaMode::Opaque },
+            // No specular: Bevy's ambient specular term spreads the ambient colour over every
+            // surface, which the game's fixed-function lighting does not have (it washed the
+            // paint colours out to grey-lavender).
+            reflectance: 0.0,
+            // Shading mode 2 (number plates, names) are decals over the surface beneath: blended
+            // through their alpha, which is empty except for the glyphs.
+            alpha_mode: if m.shading == 2 {
+                AlphaMode::Blend
+            } else if alpha {
+                AlphaMode::Mask(0.5)
+            } else {
+                AlphaMode::Opaque
+            },
             double_sided: alpha,
             cull_mode: if alpha { None } else { Some(bevy::render::render_resource::Face::Back) },
             ..default()
