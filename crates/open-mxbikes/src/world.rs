@@ -432,6 +432,12 @@ pub fn spawn_world_internal(
     });
 
     let mut ground = TerrainGround::new(terrain.clone());
+    // Track objects (fences, walls, buildings) collide through the `.map` collision mesh, in the
+    // game's left-handed frame (z mirrored here).
+    if let Some((_, m)) = &map {
+        let tris = m.collision.iter().map(|t| t.v.map(|v| Vec3::new(v.x, v.y, -v.z))).collect();
+        ground.objects = mxbikes_physics::CollisionMesh::new(tris);
+    }
     let white = images.add(scene::mask_image(&mxbikes_formats::DecodedImage {
         width: 1,
         height: 1,

@@ -19,6 +19,14 @@ fn main() {
         }
     }
     println!("extent {lo:?} .. {hi:?}");
+    println!("collision triangles {}", map.collision.len());
+    let mut words: std::collections::BTreeMap<String, usize> = Default::default();
+    for t in map.collision.iter().take(200000) {
+        *words.entry(format!("{:?}", t.words)).or_default() += 1;
+    }
+    for (w, n) in words.iter().take(12) {
+        println!("  words {w} x{n}");
+    }
     if let Some(t) = &map.terrain {
         println!("terrain layers {}", t.layers.len());
     }

@@ -8,7 +8,9 @@
 //!     object materials (as `.edf`), vertex_count, SoA vertices (80-byte stride, extra uv2),
 //!     triangles, AABB tree { bbox:f32*6 left+1:u32 right+1:u32 (inner: u32*3 | leaf: tri_count base runs { flags material first_tri tri_count first_vertex vertex_count }) }
 //!   material table (as `.edf`)
-//!   collision mesh + spatial tables (skipped)
+//!   collision (`FUN_14025d3a0`): group_count { tri_count { v0 v1 v2: vec3, words: u32*6,
+//!     extra: u32*2 } edge_count { a b: vec3, u32*4 } u32*8 (the eighth is a blob size) [blob]
+//!     grid_w grid_h [u32 * w * h] map_w map_h [u8 * w * h] }
 //!   terrain block: size_x size_z height:f32 origin:vec3 layer_count
 //!     layer: material slot (56 bytes) variant_count { material without paint layers } tiling:f32 (v304: f32*2)
 //!            has_mask:u32 [width height blob] surface_param:f32
@@ -23,6 +25,14 @@ pub struct SceneryMesh {
     pub vertices: Vec<EdfVertex>,
     pub indices: Vec<u32>,
     pub submeshes: Vec<Submesh>,
+}
+
+/// One collision triangle: corners and the six words the game stores with it (one of them is the
+/// surface; INFERRED: not decoded which).
+#[derive(Debug, Clone, Copy)]
+pub struct CollisionTriangle {
+    pub v: [glam::Vec3; 3],
+    pub words: [u32; 6],
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +65,9 @@ pub struct TerrainMaterials {
 pub struct TrackMap {
     pub version: u32,
     pub scenery: SceneryMesh,
+    /// Collision triangles of the track objects (fences, walls, buildings), in the game's
+    /// left-handed frame. Empty when the section could not be read.
+    pub collision: Vec<CollisionTriangle>,
     pub materials: Vec<Material>,
     pub terrain: Option<TerrainMaterials>,
 }
@@ -85,6 +98,7 @@ impl TrackMap {
         };
         let scenery = read_scenery(&mut r)?;
         let materials = read_material_table(&mut r)?;
+        let collision = read_collision(&mut r).unwrap_or_default();
         let terrain = match terrain_extent.filter(|_| version != 0) {
             Some(ext) => find_terrain_block(data, r.pos(), ext)
                 .map(|off| read_terrain(&mut Reader::at(data, off), version))
@@ -95,6 +109,7 @@ impl TrackMap {
             version,
             scenery,
             materials,
+            collision,
             terrain,
         })
     }
@@ -134,6 +149,32 @@ fn read_scenery(r: &mut Reader) -> Result<SceneryMesh, ReadError> {
         indices,
         submeshes,
     })
+}
+
+fn read_collision(r: &mut Reader) -> Result<Vec<CollisionTriangle>, ReadError> {
+    // Collision group table (`FUN_14025d3a0`): empty on stock tracks. (The track object list
+    // the loader reads before it is part of the material table read above.)
+    let groups = r.u32()?;
+    if groups != 0 {
+        return Err(ReadError::Implausible { what: "map collision groups", value: groups as u64, offset: r.pos() });
+    }
+    // Static collision mesh: vertices (vec3, plus 8 bytes each) and index triples.
+    let vertex_count = r.bounded_count("collision vertex count", 50_000_000)?;
+    let mut verts = Vec::with_capacity(vertex_count);
+    for _ in 0..vertex_count {
+        verts.push(r.vec3()?);
+    }
+    r.skip(vertex_count * 8)?;
+    let tri_count = r.bounded_count("collision triangle count", 50_000_000)?;
+    let mut tris = Vec::with_capacity(tri_count);
+    for _ in 0..tri_count {
+        let (a, b, c) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
+        if a >= vertex_count || b >= vertex_count || c >= vertex_count {
+            return Err(ReadError::Implausible { what: "collision triangle index", value: a.max(b).max(c) as u64, offset: r.pos() });
+        }
+        tris.push(CollisionTriangle { v: [verts[a], verts[b], verts[c]], words: [0; 6] });
+    }
+    Ok(tris)
 }
 
 fn find_terrain_block(data: &[u8], from: usize, (sx, sz, h): (f32, f32, f32)) -> Option<usize> {

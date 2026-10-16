@@ -566,7 +566,11 @@ fn ride(vfs: &MxBikesVfs, track: &str) -> i32 {
     use mxbikes_physics::{Ground, Motorcycle, TerrainGround};
     let Some(stem) = assets::find_track(vfs, track) else { return 1 };
     let terrain = TrackTerrain::parse(&vfs.read(&format!("{stem}.trh")).unwrap()).unwrap();
-    let ground = TerrainGround::new(terrain.clone());
+    let mut ground = TerrainGround::new(terrain.clone());
+    if let Some(map) = vfs.read(&format!("{stem}.map")).ok().and_then(|d| mxbikes_formats::TrackMap::parse(&d, None).ok()) {
+        let tris = map.collision.iter().map(|t| t.v.map(|v| Vec3::new(v.x, v.y, -v.z))).collect();
+        ground.objects = mxbikes_physics::CollisionMesh::new(tris);
+    }
     let def = assets::load_bike(vfs, "250xf").unwrap();
     let tyres = assets::load_tyres(vfs, "p_mx").unwrap();
     let start = assets::load_track_definition(vfs, &stem).and_then(|d| d.start).unwrap();

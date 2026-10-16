@@ -1,5 +1,6 @@
 //! Track ground: `.trh` heightfield plus per-layer surface masks and dynamic rut deformation.
 
+use crate::collision::CollisionMesh;
 use crate::motorcycle::Ground;
 use glam::Vec3;
 use mxbikes_formats::{Surface, TrackTerrain};
@@ -21,6 +22,8 @@ pub struct TerrainGround {
     pub deformation: RwLock<Vec<f32>>,
     /// Grid rectangle (i0, j0, i1, j1) deformed since the last `take_dirty`, for mesh updates.
     dirty: Mutex<Option<(u32, u32, u32, u32)>>,
+    /// Track object collision mesh from the `.map`.
+    pub objects: CollisionMesh,
 }
 
 impl Clone for TerrainGround {
@@ -31,6 +34,7 @@ impl Clone for TerrainGround {
             layers: self.layers.clone(),
             deformation: RwLock::new(def_data),
             dirty: Mutex::new(None),
+            objects: self.objects.clone(),
         }
     }
 }
@@ -62,6 +66,7 @@ impl TerrainGround {
         let deformation = RwLock::new(vec![0.0; total]);
         Self {
             dirty: Mutex::new(None),
+            objects: CollisionMesh::default(),
             terrain,
             layers,
             deformation,
@@ -231,6 +236,10 @@ impl Ground for TerrainGround {
 
     fn surface(&self, x: f32, z: f32) -> Surface {
         self.surface_at(x, z)
+    }
+
+    fn object_contact(&self, center: Vec3, radius: f32) -> Option<(Vec3, f32)> {
+        self.objects.sphere_contact(center, radius)
     }
 
     fn deform(&self, x: f32, z: f32, amount: f32) {

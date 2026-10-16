@@ -38,6 +38,11 @@ pub trait Ground {
     }
     /// Tyre deformation input at (x, z): `amount` in metres before the surface factor.
     fn deform(&self, _x: f32, _z: f32, _amount: f32) {}
+    /// Penetration of a sphere into the track objects (fences, walls, buildings): outward
+    /// normal and depth.
+    fn object_contact(&self, _center: Vec3, _radius: f32) -> Option<(Vec3, f32)> {
+        None
+    }
 }
 
 /// Flat ground at y = 0, used by tests and the empty scene.
@@ -1058,14 +1063,22 @@ impl Motorcycle {
         torque += (aero_w - self.com).cross(drag + lift);
         torque -= self.angular_velocity * self.angular_velocity.length() * 0.5;
 
-        // --- Body contacts (crash spheres from the chassis collision volumes and the rider).
+        // --- Body contacts (crash spheres from the chassis collision volumes and the rider)
+        // against the ground and the track objects; the wheels against the objects (the tyre
+        // model handles the ground).
         let mut max_contact: Option<BodyContact> = None;
-        for (local, radius) in self.body_spheres() {
-            let p = self.to_world(local);
+        let mut spheres: Vec<(Vec3, f32, bool)> = self.body_spheres().into_iter().map(|(l, r)| (self.to_world(l), r, true)).collect();
+        spheres.push((fa_w, self.front.tyre.radius(), false));
+        spheres.push((ra_w, self.rear.tyre.radius(), false));
+        for (p, radius, with_ground) in spheres {
             let gh = ground.height(p.x, p.z);
-            let depth = gh + radius - p.y;
+            let ground_depth = if with_ground { gh + radius - p.y } else { 0.0 };
+            let object = ground.object_contact(p, radius);
+            let (n, depth) = match object {
+                Some((n, d)) if d > ground_depth => (n, d),
+                _ => (ground.normal(p.x, p.z), ground_depth),
+            };
             if depth > 0.0 {
-                let n = ground.normal(p.x, p.z);
                 let vel = self.point_velocity(p);
                 let vn = vel.dot(n);
                 let fn_ = (60_000.0 * depth - 3_000.0 * vn).max(0.0);
@@ -1152,7 +1165,8 @@ impl Motorcycle {
         // Rider detachment (FUN_1401a8480, FUN_1401a79f0):
         // 1. Contact sphere: 0.31 m sphere 0.44 m above rider body point touches ground.
         let fall_world = self.to_world(self.rider_point + Vec3::new(0.0, 0.44 + self.rider.leg_pos, 0.0));
-        if fall_world.y - ground.height(fall_world.x, fall_world.z) - 0.31 <= 0.0 {
+        // The sphere is a body in the game's physics world, so the track objects count as well.
+        if fall_world.y - ground.height(fall_world.x, fall_world.z) - 0.31 <= 0.0 || ground.object_contact(fall_world, 0.31).is_some() {
             self.crashed = true;
         }
         // 2. NOT PORTED: the game also detaches the rider when the 25-step average of the forces
