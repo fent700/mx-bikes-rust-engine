@@ -771,7 +771,10 @@ fn hidden_item(dialog: &str, item: &str) -> bool {
             ],
         ),
     ];
-    if ANY.contains(&item) || (dialog == "idd_misc_options" && item.starts_with("id_autochat")) {
+    // The auto-chat boxes and their number badges (`ID_BITMAP` .. `ID_BITMAP9`; `ID_BITMAP10` is
+    // the page background).
+    let autochat_badge = item == "id_bitmap" || (item.len() == 10 && item.starts_with("id_bitmap"));
+    if ANY.contains(&item) || (dialog == "idd_misc_options" && (item.starts_with("id_autochat") || autochat_badge)) {
         return true;
     }
     LIST.iter().any(|(d, items)| *d == dialog && items.contains(&item))

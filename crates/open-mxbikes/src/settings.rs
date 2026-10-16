@@ -22,8 +22,8 @@ static DETAIL_BIAS_MILLI: AtomicU32 = AtomicU32::new(0);
 /// Window mode for `gfx/fullscreen` (1 fullscreen, 2 borderless, 0 windowed).
 pub fn window_mode(profile: &Profile) -> WindowMode {
     match profile.i("gfx", "fullscreen") {
-        1 => WindowMode::Fullscreen(MonitorSelection::Current),
-        2 => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+        1 => WindowMode::Fullscreen(MonitorSelection::Primary),
+        2 => WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
         _ => WindowMode::Windowed,
     }
 }
