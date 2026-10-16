@@ -148,7 +148,6 @@ fn main() {
                 camera::update_camera,
                 world::update_lod_switching,
                 world::follow_sky,
-                hud::update_hud,
                 ui::sync_menu_visibility,
                 ui::handle_menu_interactions,
                 ui::update_cursor,
@@ -156,6 +155,8 @@ fn main() {
             )
                 .chain(),
         )
+        .add_systems(Update, hud::update_hud.after(camera::update_camera))
+
         .add_systems(Update, world::apply_setup.after(ui::handle_menu_interactions))
         .add_systems(Update, world::handle_session_reload.after(ui::handle_menu_interactions))
         .add_systems(Startup, settings::request_initial_apply)
