@@ -490,9 +490,23 @@ pub fn spawn_world_internal(
                     mat.unlit = true;
                     mat.alpha_mode = AlphaMode::Opaque;
                     mat.cull_mode = None;
-                } else if m.diffuse.flags & 0x400 != 0 {
-                    // The ground patch fades out through its texture alpha.
-                    mat.alpha_mode = AlphaMode::Blend;
+                    if let Some(tex) = &mat.base_color_texture {
+                        if let Some(img) = images.get_mut(tex) {
+                            let (mipmap_filter, anisotropy_clamp) = crate::settings::filtering();
+                            img.sampler = bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
+                                address_mode_u: bevy::image::ImageAddressMode::Repeat,
+                                address_mode_v: bevy::image::ImageAddressMode::ClampToEdge,
+                                address_mode_w: bevy::image::ImageAddressMode::ClampToEdge,
+                                mag_filter: bevy::image::ImageFilterMode::Linear,
+                                min_filter: bevy::image::ImageFilterMode::Linear,
+                                mipmap_filter,
+                                anisotropy_clamp,
+                                ..default()
+                            });
+                        }
+                    }
+                } else {
+                    mat.alpha_mode = AlphaMode::Opaque;
                 }
             }
         }
