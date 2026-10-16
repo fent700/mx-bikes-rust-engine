@@ -104,8 +104,10 @@ pub fn render_plates(
     let mut out = HashMap::new();
 
     if let Some(font) = FontSpec::load(vfs, &font_dir, "number") {
-        // w_plate: 256x128
-        let mut plate_rgba = vec![0u8; 256 * 128 * 4];
+        // w_plate: 256x128 — fill with opaque white (the game's default plate background
+        // comes from the series/class definition; white is the most common MX plate colour).
+        // INFERRED: the exact background colour source in the engine is not decoded.
+        let mut plate_rgba = vec![255u8; 256 * 128 * 4];
         font.render_string(&mut plate_rgba, 256, 128, number, 3);
         out.insert("w_plate".to_string(), DecodedImage {
             width: 256,
@@ -114,8 +116,8 @@ pub fn render_plates(
             rgba: plate_rgba,
         });
 
-        // w_number: 256x256
-        let mut num_rgba = vec![0u8; 256 * 256 * 4];
+        // w_number: 256x256 — fill with opaque white (rider suit number plate)
+        let mut num_rgba = vec![255u8; 256 * 256 * 4];
         font.render_string(&mut num_rgba, 256, 256, number, 3);
         out.insert("w_number".to_string(), DecodedImage {
             width: 256,
@@ -123,6 +125,7 @@ pub fn render_plates(
             layers: 1,
             rgba: num_rgba,
         });
+
     }
 
     if let Some(font) = FontSpec::load(vfs, &font_dir, "name") {
