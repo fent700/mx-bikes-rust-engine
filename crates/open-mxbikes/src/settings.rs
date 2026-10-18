@@ -101,6 +101,7 @@ pub fn apply_graphics_settings(
     mut events: EventReader<ApplyGraphicsSettings>,
     profile: Option<Res<Profile>>,
     mut windows: Query<&mut Window>,
+    monitors: Query<&bevy::window::Monitor, With<bevy::window::PrimaryMonitor>>,
     mut cameras: Query<&mut Msaa, With<Camera3d>>,
     mut lights: Query<&mut DirectionalLight>,
     mut images: ResMut<Assets<Image>>,
@@ -116,11 +117,20 @@ pub fn apply_graphics_settings(
         before != filter_key()
     };
     if let Ok(mut window) = windows.get_single_mut() {
-        let (width, height) = (profile.f("gfx", "x"), profile.f("gfx", "y"));
-        if width >= 640.0 && height >= 480.0 && (window.resolution.width() != width || window.resolution.height() != height) {
-            window.resolution.set(width, height);
-        }
         let mode = window_mode(&profile);
+        // Fullscreen (borderless) always covers the monitor; the profile resolution only sizes a
+        // window, and never beyond the monitor, so the settings stay reachable.
+        if matches!(mode, WindowMode::Windowed) {
+            let (mut width, mut height) = (profile.f("gfx", "x"), profile.f("gfx", "y"));
+            if let Ok(m) = monitors.get_single() {
+                let scale = m.scale_factor as f32;
+                width = width.min(m.physical_width as f32 / scale);
+                height = height.min(m.physical_height as f32 / scale);
+            }
+            if width >= 640.0 && height >= 480.0 && (window.resolution.width() != width || window.resolution.height() != height) {
+                window.resolution.set(width, height);
+            }
+        }
         if window.mode != mode {
             window.mode = mode;
         }

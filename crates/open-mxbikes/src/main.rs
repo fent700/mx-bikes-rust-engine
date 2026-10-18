@@ -94,8 +94,10 @@ fn main() {
 
     let profile = profile::Profile::load();
     // 0 = desktop size in the game; a 1600 x 900 window stands in for it.
+    // In fullscreen the window covers the monitor whatever the profile says; a saved size only
+    // applies to a window (and is capped at the monitor once it is known, settings.rs).
     let (width, height) = match (profile.f("gfx", "x"), profile.f("gfx", "y")) {
-        (x, y) if x >= 640.0 && y >= 480.0 => (x, y),
+        (x, y) if profile.i("gfx", "fullscreen") == 0 && (640.0..=3840.0).contains(&x) && (480.0..=2160.0).contains(&y) => (x, y),
         _ => (1600.0, 900.0),
     };
     let present_mode = settings::present_mode(&profile);
